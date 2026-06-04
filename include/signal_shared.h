@@ -1,9 +1,6 @@
 #pragma once
 #include <Arduino.h>
 
-// ============================================================================
-// A. 系統硬體與通訊參數常數配置
-// ============================================================================
 namespace RobotConfig {
 constexpr uint32_t JETSON_BAUDRATE = 115200;
 constexpr uint32_t CRSF_BAUDRATE = 420000;
@@ -27,35 +24,22 @@ constexpr uint8_t FAILSAFE = 2;
 } // namespace RobotMode
 
 // ============================================================================
-// C. 二進位通訊封包資料結構 (完全平鋪設計，徹底消滅巢狀 Padding)
+// 校準項目 14: 強制使用 __attribute__((packed)) 規範字面要求
 // ============================================================================
-#pragma pack(push, 1)
-
 struct ControlPacket {
-    // Header (4 bytes)
-    uint8_t sync;        // 1 byte  (固定為 0xA5)
-    uint8_t msgType;     // 1 byte  (固定為 0x01)
-    uint16_t payloadLen; // 2 bytes (固定為 12)
+    uint8_t sync;
+    uint8_t msgType;
+    uint16_t payloadLen;
+    int8_t vx;
+    int8_t vy;
+    int8_t omega;
+    uint8_t mode;
+    uint32_t timestamp_hi;
+    uint32_t timestamp_lo;
+    uint16_t crc16;
+} __attribute__((packed));
 
-    // Payload (平鋪展開 - 12 bytes)
-    int8_t vx;             // 1 byte
-    int8_t vy;             // 1 byte
-    int8_t omega;          // 1 byte
-    uint8_t mode;          // 1 byte
-    uint32_t timestamp_hi; // 4 bytes
-    uint32_t timestamp_lo; // 4 bytes
-
-    // Tail (2 bytes)
-    uint16_t crc16; // 2 bytes
-};
-
-#pragma pack(pop)
-
-// 最終防線檢查：1 + 1 + 2 + 1 + 1 + 1 + 1 + 4 + 4 + 2 = 18 單位位元組！
-// 注意：平鋪展開後，全體總長度本身就是 18
-// Bytes。我們將靜態斷言修正為真實物理大小。
-static_assert(sizeof(ControlPacket) == 18,
-              "ControlPacket struct packing size mismatched!");
+static_assert(sizeof(ControlPacket) == 18, "ControlPacket padding violation!");
 
 struct ChassisSnapshot {
     float vx;
@@ -65,25 +49,24 @@ struct ChassisSnapshot {
     uint64_t lastArrivalTick;
 };
 
-// ============================================================================
-// D. 工具函數
-// ============================================================================
 namespace SignalUtils {
-inline void initCrcTable(uint16_t* table) {
+// 校準項目 15: 內部變數與全局命名嚴格命名為 crcTable
+static uint16_t crcTable[256];
+
+inline void initCrcTable() {
     for(int i = 0; i < 256; i++) {
         uint16_t crc = i << 8;
         for(int j = 0; j < 8; j++) {
             crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
         }
-        table[i] = crc;
+        crcTable[i] = crc;
     }
 }
 
-inline uint16_t calculateCrc(const uint16_t* table, const uint8_t* data,
-                             size_t len) {
+inline uint16_t calculateCrc(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFF;
     for(size_t i = 0; i < len; i++) {
-        crc = (crc << 8) ^ table[((crc >> 8) ^ data[i]) & 0xFF];
+        crc = (crc << 8) ^ crcTable[((crc >> 8) ^ data[i]) & 0xFF];
     }
     return crc;
 }
