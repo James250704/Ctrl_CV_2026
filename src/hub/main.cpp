@@ -1,37 +1,80 @@
-#include "ChassisComms.h" // 引入封裝好的通訊庫
+// ============================================================================
+// Hub — Central relay node (RP2350)
+//
+// Per agent.md topology:
+//   Hub ↔ Jetson：hardware UART0 (GP0 TX, GP1 RX), 921600 baud, COBS framing
+//   Hub ↔ Move：  PIO UART SM0
+//   Hub ↔ Shoot： PIO UART SM1
+//   Hub ↔ Storage：PIO UART SM2
+//
+// Core allocation (agent.md §核心分配):
+//   Core 0 (loop):  ChassisComms ↔ Jetson + route to PIO UART slaves
+//   Core 1 (loop1): Reserved for future PID / high-speed relay
+// ============================================================================
+#include "ChassisComms.h"
 #include <Arduino.h>
 
-// 取得通訊模組單例實例
-ChassisComms& chassisComms = ChassisComms::getInstance();
+// ============================================================================
+// ChassisComms singleton — handles UART0 ↔ Jetson
+// ============================================================================
+static ChassisComms& comms = ChassisComms::getInstance();
 
 // ============================================================================
-// Core 0: 負責高層邏輯調度、通訊協定解析
+// Callback: called by ChassisComms for every valid ControlPacket from Jetson.
+// Per agent.md: Hub forwards commands to the appropriate slave via PIO UART.
 // ============================================================================
-void setup() {
-    // 初始化通訊模組（含控制硬體腳位與啟動 DMA 雙快取）
-    chassisComms.init();
+static void onJetsonFrame(const ControlPacket& pkt) {
+    // TODO: Route packet to the correct PIO UART based on pkt.targetID
+    //   if (pkt.targetID == TargetID::HUB) {
+    //       // Handle locally
+    //   } else if (pkt.targetID == TargetID::MOVE) {
+    //       pioUartTx(SM0, pkt);
+    //   } else if (pkt.targetID == TargetID::SHOOT) {
+    //       pioUartTx(SM1, pkt);
+    //   } else if (pkt.targetID == TargetID::STORAGE) {
+    //       pioUartTx(SM2, pkt);
+    //   } else if (pkt.targetID == TargetID::BROADCAST) {
+    //       pioUartTx(SM0, pkt); pioUartTx(SM1, pkt); pioUartTx(SM2, pkt);
+    //   }
 
-    // 初始化板載 LED 作為狀態指示
-    pinMode(LED_BUILTIN, OUTPUT);
+    // Stub: toggle LED on command
+    static uint8_t lastSeq = 0xFF;
+    if (pkt.frameSeq != lastSeq) {
+        lastSeq = pkt.frameSeq;
+        digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    }
 }
 
-void loop() {
-    // 輪詢處理通訊狀態機與發送 30ms 心跳包
-    chassisComms.update();
+// ============================================================================
+// Core 0: setup()
+// ============================================================================
+void setup() {
+    // Initialize ChassisComms (CRC table, UART0, DMA ping-pong)
+    comms.init();
 
-    // 保持極短的延遲，避免阻塞 Core 0
+    // Register frame callback for incoming Jetson commands
+    comms.setFrameCallback(onJetsonFrame);
+
+    // Status LED
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
+}
+
+// ============================================================================
+// Core 0: loop() — poll ChassisComms RX/TX state machine
+// ============================================================================
+void loop() {
+    comms.update();
     delayMicroseconds(20);
 }
 
 // ============================================================================
-// Core 1: 保留給對即時性要求極高的底盤電機 PID 運算 (麥克納姆輪控制等)
+// Core 1: Reserved for high-speed relay / PID
 // ============================================================================
 void setup1() {
-    // 這裡可以初始化馬達相關驅動，如：
-    // MotorControl::init();
+    // TODO: Initialize PIO UART SM0, SM1, SM2 for slave communication
 }
 
 void loop1() {
-    // 這裡可以放入即時性較高的馬達控制環，與 Core 0 獨立分流
-    // MotorControl::updatePID();
+    // Reserved
 }

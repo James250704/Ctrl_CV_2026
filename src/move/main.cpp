@@ -1,135 +1,323 @@
+// ============================================================================
+// Move — Slave node (RP2350)
+//
+// Per agent.md topology:
+//   Hub(Move) ↔ Move：PIO UART (SM0), 921600 baud, COBS framing
+//
+// Core allocation (agent.md §核心分配):
+//   Core 0 (loop):   PIO UART RX/TX → COBS → CRC → notify Core 1
+//   Core 1 (loop1):  Triggered by Core 0 → execute mecanum wheel motor control
+//
+// Core 1 sync pattern (agent.md §核心間同步機制):
+//   Core 0 writes SlaveCommand to lock-free double-buffer with release store
+//   Core 1 spinloops with acquire load, memcpy snapshot, executes, loops back
+// ============================================================================
 #include "signal_shared.h"
 #include <Arduino.h>
 #include <atomic>
-#include <hardware/dma.h>
 #include <hardware/uart.h>
 
-// 校準項目 7: 明確指定實體硬體引腳與配置
-#define CHASSIS_UART_HARDWARE uart0
-#define CHASSIS_UART_SERIAL Serial1
-#define CHASSIS_TX_PIN 16 // GP16 = Pin 21
-#define CHASSIS_RX_PIN 17 // GP17 = Pin 22
+// ============================================================================
+// Core 0 ↔ Core 1 lock-free command buffer (agent.md §核心間通訊)
+// ============================================================================
+static struct SlaveCommand {
+    ChassisSnapshot snapshot;
+    bool            estopActive;
+} cmdBuf[2];
+static std::atomic<uint8_t> cmdWriteIdx{0};
+static std::atomic<bool>    estopActive{false};
 
-// DMA Ping-Pong 靜態快取分配 (各 512 位元組)
-static uint8_t dmaBuffer[2][512];
-static int dmaChanA, dmaChanB;
-static std::atomic<uint32_t> activeDmaBuf(0);
+// ============================================================================
+// PIO UART state (placeholder — PIO SM0 will be configured here)
+// Per agent.md: Slaves use PIO UART, not hardware UART peripherals.
+// PIO SM0 handles both TX and RX at 921600 baud.
+// PIO program loaded from .pio file; SM configured with proper GPIOs.
+// ============================================================================
+static constexpr uint8_t PIO_SLAVE_TX_PIN = 4;  // GP4 (TBD — per hub ↔ slave pinout)
+static constexpr uint8_t PIO_SLAVE_RX_PIN = 5;  // GP5 (TBD)
 
-void initUartDmaPingPong() {
-    // 配置 UART 數據傳輸至 DMA
-    uart_set_fifo_enabled(CHASSIS_UART_HARDWARE, true);
+// COBS scan state — .bss allocated, no heap
+static uint8_t parseWorkBuf[512];
+static size_t  workBufIdx = 0;
+static uint8_t lastFrameSeq  = 0;
+static bool    firstFrame    = true;
 
-    dmaChanA = dma_claim_unused_channel(true);
-    dmaChanB = dma_claim_unused_channel(true);
+// E-Stop timeout tracking
+static uint64_t lastValidCmdTime   = 0;
+static bool     motorPowerOn       = false;
 
-    // 通道 A 配置 (寫入 dmaBuffer[0])
-    dma_channel_config cA = dma_channel_get_default_config(dmaChanA);
-    channel_config_set_transfer_data_size(&cA, DMA_SIZE_8);
-    channel_config_set_read_increment(&cA, false); // 固定讀取 UART RX FIFO
-    channel_config_set_write_increment(&cA, true); // 自動累加寫入 Buffer
-    channel_config_set_dreq(&cA, uart_get_dreq(CHASSIS_UART_HARDWARE, false));
-    channel_config_set_chain_to(&cA, dmaChanB); // 滿了自動啟動 B 通道
+// Heartbeat
+static uint64_t lastHeartbeatTime  = 0;
 
-    dma_channel_configure(dmaChanA, &cA, dmaBuffer[0],
-                          &uart_get_hw(CHASSIS_UART_HARDWARE)->dr, 512, false);
+// ============================================================================
+// Forward declarations for Core 1 PIO motor control
+// Stubs — replace with real MotorControl library once available.
+// ============================================================================
+namespace MotorControl {
+void init() { /* TODO: init PIO PWM / encoder */ }
+void executeMotion(const ChassisSnapshot&) { /* TODO: apply motor setpoints */ }
+void estop() { /* TODO: zero all PWM */ }
+} // namespace MotorControl
 
-    // 通道 B 配置 (寫入 dmaBuffer[1])
-    dma_channel_config cB = dma_channel_get_default_config(dmaChanB);
-    channel_config_set_transfer_data_size(&cB, DMA_SIZE_8);
-    channel_config_set_read_increment(&cB, false);
-    channel_config_set_write_increment(&cB, true);
-    channel_config_set_dreq(&cB, uart_get_dreq(CHASSIS_UART_HARDWARE, false));
-    channel_config_set_chain_to(&cB, dmaChanA); // 滿了自動換回 A 通道
+// ============================================================================
+// Core 0: Process a fully decoded + CRC-verified COBS frame
+//   - FrameSeq anti-duplicate
+//   - Write to Core 1 double-buffer with release semantics
+//   - Track lastValidCmdTime for E-Stop timeout
+// ============================================================================
+static void processCommand(const ControlPacket& pkt) {
+    // FrameSeq duplicate check
+    if (!firstFrame && pkt.frameSeq == lastFrameSeq)
+        return;
+    firstFrame   = false;
+    lastFrameSeq = pkt.frameSeq;
 
-    dma_channel_configure(dmaChanB, &cB, dmaBuffer[1],
-                          &uart_get_hw(CHASSIS_UART_HARDWARE)->dr, 512, false);
+    // Translate wire-format ControlPacket to in-memory ChassisSnapshot
+    ChassisSnapshot snap;
+    snap.vx               = static_cast<float>(pkt.vx);
+    snap.vy               = static_cast<float>(pkt.vy);
+    snap.omega            = static_cast<float>(pkt.omega);
+    snap.mode             = pkt.mode;
+    snap.frameSeq         = pkt.frameSeq;
+    snap.lastArrivalTick  = time_us_64();
 
-    // 啟動首發 DMA
-    dma_channel_start(dmaChanA);
+    // Write to double-buffer with release semantics (agent.md §核心間通訊)
+    uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
+    cmdBuf[idx].snapshot    = snap;
+    cmdBuf[idx].estopActive = false;
+    cmdWriteIdx.store(idx ^ 1, std::memory_order_release);
+
+    lastValidCmdTime = snap.lastArrivalTick;
+    motorPowerOn     = true;
 }
 
-void setup() {
-    // 校準項目 15: 初始化全局靜態 CrcTable
-    SignalUtils::initCrcTable();
+// ============================================================================
+// Core 0: Process E-Stop from Hub (targetID == BROADCAST, msgType == ESTOP)
+// ============================================================================
+static void processEStop(const ControlPacket& pkt) {
+    (void)pkt;
+    estopActive.store(true, std::memory_order_release);
 
-    // 校準項目 7: 嚴格依照 Spec 指定實體硬體腳位初始化 UART
-    CHASSIS_UART_SERIAL.setTX(CHASSIS_TX_PIN);
-    CHASSIS_UART_SERIAL.setRX(CHASSIS_RX_PIN);
-    CHASSIS_UART_SERIAL.begin(RobotConfig::CHASSIS_BAUDRATE);
+    // Also write to double-buffer so Core 1 immediately sees it
+    uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
+    cmdBuf[idx].estopActive = true;
+    cmdBuf[idx].snapshot.vx = cmdBuf[idx].snapshot.vy =
+        cmdBuf[idx].snapshot.omega = 0;
+    cmdBuf[idx].snapshot.mode = RobotMode::FAILSAFE;
+    cmdWriteIdx.store(idx ^ 1, std::memory_order_release);
 
-    initUartDmaPingPong();
-    pinMode(LED_BUILTIN, OUTPUT);
+    motorPowerOn = false;
 }
 
-// Core 0 分批解析狀態機
-void loop() {
-    static size_t scanPos = 0;
-    static uint8_t parseWorkBuf[512];
-    static size_t workBufIdx = 0;
+// ============================================================================
+// Core 0: PIO UART receive wrapper (placeholder until PIO SM0 is connected)
+// Non-blocking: returns number of bytes read (max 64), 0 if none available.
+// ============================================================================
+static size_t pioUartReadBytes(uint8_t* buf, size_t maxLen) {
+    // TODO: Replace with actual PIO SM0 RX read
+    //   sm = pio_get_index(pio0), SM0
+    //   if (pio_sm_get_rx_fifo_level(pio, sm) > 0)
+    //       buf[n++] = pio_sm_get(pio, sm) & 0xFF;
+    // Stub: no bytes available
+    (void)buf;
+    (void)maxLen;
+    return 0;
+}
 
-    // 獲取當前未被 DMA 佔用的唯讀緩衝區索引
-    uint32_t currentActive = dma_channel_is_busy(dmaChanA) ? 1 : 0;
-    uint8_t* readBuffer = dmaBuffer[currentActive ^ 1];
+// ============================================================================
+// Core 0: PIO UART send wrapper (placeholder)
+// ============================================================================
+static void pioUartSendBytes(const uint8_t* buf, size_t len) {
+    // TODO: Replace with actual PIO SM0 TX push
+    //   for (size_t i = 0; i < len; i++)
+    //       pio_sm_put_blocking(pio0, 0, buf[i]);
+    (void)buf;
+    (void)len;
+}
 
-    // 每次限制處理最多 64 bytes，保證單次 loop 週期 < 200μs
-    size_t processedBytes = 0;
-    while(scanPos < 512 && processedBytes < 64) {
-        uint8_t byte = readBuffer[scanPos++];
-        processedBytes++;
+// ============================================================================
+// Core 0: COBS scan pass — called each loop() iteration
+// Processes up to 64 bytes looking for 0x00 delimiters.
+// ============================================================================
+static void processPioUartRx() {
+    uint8_t rawBuf[64];
+    size_t  nRead = pioUartReadBytes(rawBuf, sizeof(rawBuf));
+    if (nRead == 0) return;
 
-        if(byte == 0x00) { // 尋獲分包終止符
-            if(workBufIdx > sizeof(ControlPacket)) {
-                // 解碼與執行處理 (細節由通訊混合狀態機接尾)
+    for (size_t i = 0; i < nRead; i++) {
+        uint8_t byte = rawBuf[i];
+
+        if (byte == 0x00) {
+            // End of COBS frame
+            if (workBufIdx >= sizeof(ControlPacket)) {
+                uint8_t decoded[512];
+                size_t  decLen = SignalUtils::cobsDecode(parseWorkBuf,
+                                                          workBufIdx,
+                                                          decoded);
+                if (decLen >= sizeof(ControlPacket)) {
+                    const ControlPacket& pkt =
+                        *reinterpret_cast<const ControlPacket*>(decoded);
+
+                    // CRC verify
+                    uint16_t storedCrc = pkt.crc16;
+                    uint16_t calcCrc   = SignalUtils::calculateCrc(
+                                             decoded,
+                                             sizeof(ControlPacket) - 2);
+                    if (storedCrc == calcCrc) {
+                        if (pkt.sync == 0xA5) {
+                            if (pkt.msgType == MsgType::HEARTBEAT ||
+                                pkt.msgType == MsgType::CONTROL) {
+                                processCommand(pkt);
+                            } else if (pkt.msgType == MsgType::ESTOP) {
+                                processEStop(pkt);
+                            }
+                        }
+                    }
+                    // CRC mismatch → silently drop (agent.md rule)
+                }
             }
-            workBufIdx = 0; // 重置
+            workBufIdx = 0;
         } else {
-            if(workBufIdx < 511)
+            if (workBufIdx < sizeof(parseWorkBuf) - 1)
                 parseWorkBuf[workBufIdx++] = byte;
         }
     }
+}
 
-    if(scanPos >= 512)
-        scanPos = 0;
-
-    // ============================================================================
-    // 校準項目 6: 落實通訊心跳定時器閘控 (每 30ms 強制發送心跳幀至下位機)
-    // ============================================================================
-    static uint64_t lastHeartbeatTime = 0;
+// ============================================================================
+// Core 0: Send heartbeat upstream to Hub via PIO UART
+// Heartbeat: 30ms interval, mode=FAILSAFE (agent.md §心跳)
+// ============================================================================
+static void sendHeartbeat() {
     uint64_t now = time_us_64();
+    if (now - lastHeartbeatTime < RobotConfig::HEARTBEAT_INTERVAL_US)
+        return;
+    lastHeartbeatTime = now;
 
-    if(now - lastHeartbeatTime >= 30000) { // 30ms 週期
-        lastHeartbeatTime = now;
+    static uint8_t hbFrameSeq = 0;
 
-        ControlPacket heartbeatPacket;
-        heartbeatPacket.sync = 0xA5;
-        heartbeatPacket.msgType = 0x01; // 心跳/控制指令同一封包結構
-        heartbeatPacket.payloadLen = 12;
-        heartbeatPacket.vx = 0;
-        heartbeatPacket.vy = 0;
-        heartbeatPacket.omega = 0;
-        heartbeatPacket.mode = RobotMode::FAILSAFE; // 心跳預設維持安全狀態
-        heartbeatPacket.timestamp_hi = (uint32_t)(now >> 32);
-        heartbeatPacket.timestamp_lo = (uint32_t)(now & 0xFFFFFFFF);
+    ControlPacket pkt;
+    pkt.sync       = 0xA5;
+    pkt.msgType    = MsgType::HEARTBEAT;
+    pkt.frameSeq   = hbFrameSeq++;
+    pkt.targetID   = TargetID::HUB;
+    pkt.payloadLen = sizeof(ControlPacket) - 6;
+    pkt.vx         = 0;
+    pkt.vy         = 0;
+    pkt.omega      = 0;
+    pkt.mode       = RobotMode::FAILSAFE;
+    pkt.timestamp_hi = static_cast<uint32_t>(now >> 32);
+    pkt.timestamp_lo = static_cast<uint32_t>(now & 0xFFFFFFFF);
+    pkt.crc16      = 0;
 
-        heartbeatPacket.crc16 = SignalUtils::calculateCrc(
-            reinterpret_cast<uint8_t*>(&heartbeatPacket),
-            sizeof(ControlPacket) - 2);
+    pkt.crc16 = SignalUtils::calculateCrc(
+                    reinterpret_cast<uint8_t*>(&pkt),
+                    sizeof(ControlPacket) - 2);
 
-        uint8_t encodeWorkspace[sizeof(ControlPacket) + 2];
-        size_t encodedLen = SignalUtils::cobsEncode(
-            reinterpret_cast<uint8_t*>(&heartbeatPacket), sizeof(ControlPacket),
-            encodeWorkspace);
+    uint8_t  cobsBuf[sizeof(ControlPacket) + 2];
+    size_t   cobsLen = SignalUtils::cobsEncode(
+                          reinterpret_cast<const uint8_t*>(&pkt),
+                          sizeof(ControlPacket),
+                          cobsBuf);
+    cobsBuf[cobsLen] = 0x00;
 
-        // 校準項目 7: 寫入完畢後，必須補齊 0x00 分隔符作為影格結束標誌
-        encodeWorkspace[encodedLen] = 0x00;
+    pioUartSendBytes(cobsBuf, cobsLen + 1);
+}
 
-        if(CHASSIS_UART_SERIAL.availableForWrite() >= (int)(encodedLen + 1)) {
-            CHASSIS_UART_SERIAL.write(encodeWorkspace, encodedLen + 1);
-        }
+// ============================================================================
+// Core 0: E-Stop timeout checker (agent.md §指令超時保護)
+// If no valid command received for >100ms, trigger E-Stop.
+// ============================================================================
+static void checkTimeout() {
+    if (!motorPowerOn) return;
+
+    uint64_t now = time_us_64();
+    if (now - lastValidCmdTime > RobotConfig::COMMAND_TIMEOUT_US) {
+        // Timeout — notify Core 1
+        estopActive.store(true, std::memory_order_release);
+
+        uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
+        cmdBuf[idx].estopActive = true;
+        cmdBuf[idx].snapshot.vx = cmdBuf[idx].snapshot.vy =
+            cmdBuf[idx].snapshot.omega = 0;
+        cmdBuf[idx].snapshot.mode = RobotMode::FAILSAFE;
+        cmdWriteIdx.store(idx ^ 1, std::memory_order_release);
+
+        motorPowerOn = false;
     }
+}
 
+// ============================================================================
+// Core 0: setup()
+// ============================================================================
+void setup() {
+    // CRC table is compile-time const — no init needed.
+
+    // TODO: Initialize PIO SM0 for UART TX/RX
+    //   pio_sm_claim(pio0, 0);
+    //   pio_add_program(pio0, &cobs_uart_program);
+    //   cobs_uart_program_init(pio0, 0, PIO_SLAVE_TX_PIN, PIO_SLAVE_RX_PIN, 921600);
+
+    // Initialize motor control on Core 1
+    // MotorControl::init() called from setup1() instead
+
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
+}
+
+// ============================================================================
+// Core 0: loop() — COBS frame parsing + UART heartbeat + timeout check
+// ============================================================================
+void loop() {
+    processPioUartRx();
+    sendHeartbeat();
+    checkTimeout();
+
+    // Keep loop rate high — Core 0 should never block
     delayMicroseconds(20);
 }
 
-void setup1() {}
-void loop1() {}
+// ============================================================================
+// Core 1: setup1() — Initialize PIO PWM and encoder peripherals
+// ============================================================================
+void setup1() {
+    MotorControl::init();
+
+    // Wait for first command from Core 0 before enabling motors
+    motorPowerOn = false;
+}
+
+// ============================================================================
+// Core 1: loop1() — Spinloop waiting for Core 0 commands
+//
+// Per agent.md §核心間同步機制:
+//   1. acquire-load cmdWriteIdx
+//   2. memcpy snapshot from other buffer
+//   3. execute motor control
+//   4. check E-Stop on each cycle
+//   5. loop back
+// ============================================================================
+void loop1() {
+    while (true) {
+        // Acquire-load the latest write index (agent.md §核心間通訊)
+        uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
+        uint8_t readIdx = idx ^ 1;
+
+        // Snapshot command via memcpy (avoids data race on struct fields)
+        ChassisSnapshot cmd;
+        bool estop;
+        memcpy(&cmd, &cmdBuf[readIdx].snapshot, sizeof(cmd));
+        estop = cmdBuf[readIdx].estopActive;
+
+        // Check global E-Stop flag too
+        if (estop || estopActive.load(std::memory_order_acquire)) {
+            MotorControl::estop();
+            motorPowerOn = false;
+        } else {
+            motorPowerOn = true;
+            MotorControl::executeMotion(cmd);
+        }
+
+        // Tight spin — no delay()
+    }
+}

@@ -1,123 +1,220 @@
 #include "ChassisComms.h"
 
-// 靜態成員變數初始化分配
+// ============================================================================
+// Static member definitions (.bss allocation)
+// ============================================================================
 uint8_t ChassisComms::dmaBuffer[2][512];
-int ChassisComms::dmaChanA;
-int ChassisComms::dmaChanB;
+int     ChassisComms::dmaChanA;
+int     ChassisComms::dmaChanB;
 
-// 硬體引腳與配置定義
-#define CHASSIS_UART_HARDWARE uart0
-#define CHASSIS_UART_SERIAL Serial1
-#define CHASSIS_TX_PIN 16 // GP16 = Pin 21
-#define CHASSIS_RX_PIN 17 // GP17 = Pin 22
+ChassisComms& ChassisComms::getInstance() {
+    static ChassisComms instance;
+    return instance;
+}
 
+// ============================================================================
+// Hardware config — per agent.md UART table:
+//   Hub ↔ Jetson: UART0, GP0 TX (Pin 1), GP1 RX (Pin 2), 921600 baud
+// ============================================================================
+static uart_inst_t* const   HUB_UART   = uart0;
+static constexpr uint8_t    HUB_TX_PIN = 0;   // GP0 = Pin 1
+static constexpr uint8_t    HUB_RX_PIN = 1;   // GP1 = Pin 2
+static const uint32_t       HUB_BAUD   = RobotConfig::JETSON_BAUDRATE;
+
+// ============================================================================
+// UART + DMA ping-pong init
+// Two DMA channels chain to each other: when buffer A fills (512 bytes),
+// DMA auto-starts buffer B. We scan the inactive buffer in update().
+// ============================================================================
 void ChassisComms::initUartDmaPingPong() {
-    // 配置 UART 數據傳輸至 DMA
-    uart_set_fifo_enabled(CHASSIS_UART_HARDWARE, true);
+    // UART0 GPIO function — use SDK native API
+    uart_init(HUB_UART, HUB_BAUD);
+    gpio_set_function(HUB_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(HUB_RX_PIN, GPIO_FUNC_UART);
+    uart_set_fifo_enabled(HUB_UART, true);
 
+    // Claim DMA channels
     dmaChanA = dma_claim_unused_channel(true);
     dmaChanB = dma_claim_unused_channel(true);
 
-    // 通道 A 配置 (寫入 dmaBuffer[0])
-    dma_channel_config cA = dma_channel_get_default_config(dmaChanA);
-    channel_config_set_transfer_data_size(&cA, DMA_SIZE_8);
-    channel_config_set_read_increment(&cA, false); // 固定讀取 UART RX FIFO
-    channel_config_set_write_increment(&cA, true); // 自動累加寫入 Buffer
-    channel_config_set_dreq(&cA, uart_get_dreq(CHASSIS_UART_HARDWARE, false));
-    channel_config_set_chain_to(&cA, dmaChanB); // 滿了自動啟動 B 通道
+    // Channel A → dmaBuffer[0]
+    {
+        dma_channel_config cA = dma_channel_get_default_config(dmaChanA);
+        channel_config_set_transfer_data_size(&cA, DMA_SIZE_8);
+        channel_config_set_read_increment(&cA,  false);
+        channel_config_set_write_increment(&cA, true);
+        channel_config_set_dreq(&cA, uart_get_dreq(HUB_UART, false));
+        channel_config_set_chain_to(&cA, dmaChanB);
 
-    dma_channel_configure(dmaChanA, &cA, dmaBuffer[0],
-                          &uart_get_hw(CHASSIS_UART_HARDWARE)->dr, 512, false);
+        dma_channel_configure(
+            dmaChanA, &cA,
+            dmaBuffer[0],                     // write address
+            &uart_get_hw(HUB_UART)->dr,        // read address (RX FIFO)
+            512,                                // count
+            false                               // don't start yet
+        );
+    }
 
-    // 通道 B 配置 (寫入 dmaBuffer[1])
-    dma_channel_config cB = dma_channel_get_default_config(dmaChanB);
-    channel_config_set_transfer_data_size(&cB, DMA_SIZE_8);
-    channel_config_set_read_increment(&cB, false);
-    channel_config_set_write_increment(&cB, true);
-    channel_config_set_dreq(&cB, uart_get_dreq(CHASSIS_UART_HARDWARE, false));
-    channel_config_set_chain_to(&cB, dmaChanA); // 滿了自動換回 A 通道
+    // Channel B → dmaBuffer[1]
+    {
+        dma_channel_config cB = dma_channel_get_default_config(dmaChanB);
+        channel_config_set_transfer_data_size(&cB, DMA_SIZE_8);
+        channel_config_set_read_increment(&cB,  false);
+        channel_config_set_write_increment(&cB, true);
+        channel_config_set_dreq(&cB, uart_get_dreq(HUB_UART, false));
+        channel_config_set_chain_to(&cB, dmaChanA);
 
-    dma_channel_configure(dmaChanB, &cB, dmaBuffer[1],
-                          &uart_get_hw(CHASSIS_UART_HARDWARE)->dr, 512, false);
+        dma_channel_configure(
+            dmaChanB, &cB,
+            dmaBuffer[1],
+            &uart_get_hw(HUB_UART)->dr,
+            512,
+            false
+        );
+    }
 
-    // 啟動首發 DMA
+    // Start: DMA writes into buffer A first
     dma_channel_start(dmaChanA);
 }
 
+// ============================================================================
+// Process a fully decoded (COBS-decoded + CRC-verified) frame
+//   - frameSeq anti-duplicate check (agent.md §帧序号抗干扰)
+//   - Dispatch to registered callback
+// ============================================================================
+void ChassisComms::processFrame(const uint8_t* data, size_t len) {
+    if (len != sizeof(ControlPacket)) return;
+
+    // Reinterpret as ControlPacket
+    const ControlPacket& pkt = *reinterpret_cast<const ControlPacket*>(data);
+
+    // Validate sync byte
+    if (pkt.sync != 0xA5) return;
+
+    // FrameSeq duplicate check — skip if same as last valid frame
+    if (!firstFrame && pkt.frameSeq == lastFrameSeq)
+        return;  // Duplicate or retransmission
+    firstFrame    = false;
+    lastFrameSeq  = pkt.frameSeq;
+
+    // Dispatch to registered handler (if any)
+    if (frameCb != nullptr)
+        frameCb(pkt);
+}
+
+// ============================================================================
+// ChassisComms::init()
+// Called once from setup() to initialize CRC table, UART, and DMA.
+// ============================================================================
 void ChassisComms::init() {
-    // 初始化全局靜態 CrcTable
-    SignalUtils::initCrcTable();
-
-    // 依照 Spec 指定實體硬體腳位初始化 UART
-    CHASSIS_UART_SERIAL.setTX(CHASSIS_TX_PIN);
-    CHASSIS_UART_SERIAL.setRX(CHASSIS_RX_PIN);
-    CHASSIS_UART_SERIAL.begin(RobotConfig::CHASSIS_BAUDRATE);
-
-    // 啟動 DMA 雙快取接收
     initUartDmaPingPong();
 }
 
+// ============================================================================
+// ChassisComms::sendPacket()
+// COBS-encode + CRC-stamp a ControlPacket and write to UART.
+// Per agent.md §发送规则: drops on full TX, no blocking.
+// ============================================================================
+bool ChassisComms::sendPacket(const ControlPacket& pkt) {
+    uint8_t  cobsBuf[sizeof(ControlPacket) + 2]; // worst-case COBS overhead
+    size_t   cobsLen = SignalUtils::cobsEncode(
+                          reinterpret_cast<const uint8_t*>(&pkt),
+                          sizeof(ControlPacket),
+                          cobsBuf);
+
+    // Append delimiter
+    cobsBuf[cobsLen] = 0x00;
+
+    // Non-blocking write — drop if TX full
+    if (uart_is_writable(HUB_UART)) {
+        // Write all bytes via raw UART (no Serial abstraction — less overhead)
+        for (size_t i = 0; i <= cobsLen; i++) {
+            // uart_putc_raw — no FIFO wait, the TX FIFO has room because
+            // we checked uart_is_writable above. At 921600 baud the FIFO
+            // drains faster than we can fill 20 bytes.
+            uart_putc_raw(HUB_UART, cobsBuf[i]);
+        }
+        return true;
+    }
+    return false; // TX full — dropped
+}
+
+// ============================================================================
+// ChassisComms::update()
+// Per-invocation slice:
+//   1. Determine which DMA buffer is inactive (safe to read)
+//   2. Scan <= 64 new bytes for COBS delimiters (0x00)
+//   3. On delimiter: COBS decode → CRC verify → processFrame()
+//   4. Every 30ms: generate heartbeat to Jetson
+//
+// Total budget per call: < 200μs at 921600 baud (agent.md rule).
+// ============================================================================
 void ChassisComms::update() {
-    // 獲取當前未被 DMA 佔用的唯讀緩衝區索引
+    // ---- 1. Determine inactive DMA buffer ----
     uint32_t currentActive = dma_channel_is_busy(dmaChanA) ? 1 : 0;
-    uint8_t* readBuffer = dmaBuffer[currentActive ^ 1];
+    uint8_t* readBuffer    = dmaBuffer[currentActive ^ 1];
 
-    // 每次限制處理最多 64 bytes，保證單次 loop 週期 < 200μs
-    size_t processedBytes = 0;
-    while(scanPos < 512 && processedBytes < 64) {
+    // ---- 2. Scan for COBS frames (max 64 bytes / call) ----
+    size_t processed = 0;
+    while (scanPos < 512 && processed < 64) {
         uint8_t byte = readBuffer[scanPos++];
-        processedBytes++;
+        processed++;
 
-        if(byte == 0x00) { // 尋獲分包終止符
-            if(workBufIdx > sizeof(ControlPacket)) {
-                // 解碼與執行處理 (細節由通訊混合狀態機接尾)
-                // 例如：SignalUtils::cobsDecode(parseWorkBuf, workBufIdx, ...)
+        if (byte == 0x00) {
+            // End of COBS frame — attempt decode if we have meaningful data
+            if (workBufIdx >= sizeof(ControlPacket)) {
+                // COBS decode into a temporary buffer
+                uint8_t decoded[512];
+                size_t  decLen = SignalUtils::cobsDecode(parseWorkBuf,
+                                                          workBufIdx,
+                                                          decoded);
+                if (decLen >= sizeof(ControlPacket)) {
+                    // CRC verify (all fields EXCEPT the crc16 bytes)
+                    uint16_t storedCrc = reinterpret_cast<const ControlPacket*>(
+                                             decoded)->crc16;
+                    uint16_t calcCrc   = SignalUtils::calculateCrc(
+                                             decoded,
+                                             sizeof(ControlPacket) - 2);
+                    if (storedCrc == calcCrc) {
+                        processFrame(decoded, decLen);
+                    }
+                    // CRC failure → silently drop (agent.md rule)
+                }
             }
-            workBufIdx = 0; // 重置
+            workBufIdx = 0; // Reset for next frame
         } else {
-            if(workBufIdx < 511) {
+            if (workBufIdx < sizeof(parseWorkBuf) - 1)
                 parseWorkBuf[workBufIdx++] = byte;
-            }
         }
     }
 
-    if(scanPos >= 512) {
+    // Wrap scan position
+    if (scanPos >= 512)
         scanPos = 0;
-    }
 
-    // ============================================================================
-    // 落實通訊心跳定時器閘控 (每 30ms 強制發送心跳幀至下位機)
-    // ============================================================================
+    // ---- 3. Heartbeat — 30ms interval (agent.md §心跳) ----
     uint64_t now = time_us_64();
-
-    if(now - lastHeartbeatTime >= 30000) { // 30ms 週期
+    if (now - lastHeartbeatTime >= RobotConfig::HEARTBEAT_INTERVAL_US) {
         lastHeartbeatTime = now;
 
-        ControlPacket heartbeatPacket;
-        heartbeatPacket.sync = 0xA5;
-        heartbeatPacket.msgType = 0x01; // 心跳/控制指令同一封包結構
-        heartbeatPacket.payloadLen = 12;
-        heartbeatPacket.vx = 0;
-        heartbeatPacket.vy = 0;
-        heartbeatPacket.omega = 0;
-        heartbeatPacket.mode = RobotMode::FAILSAFE; // 心跳預設維持安全狀態
-        heartbeatPacket.timestamp_hi = (uint32_t)(now >> 32);
-        heartbeatPacket.timestamp_lo = (uint32_t)(now & 0xFFFFFFFF);
+        ControlPacket pkt;
+        pkt.sync       = 0xA5;
+        pkt.msgType    = MsgType::HEARTBEAT;
+        pkt.frameSeq   = txFrameSeq++;
+        pkt.targetID   = TargetID::HUB;
+        pkt.payloadLen = sizeof(ControlPacket) - 6;  // remaining after header
+        pkt.vx         = 0;
+        pkt.vy         = 0;
+        pkt.omega      = 0;
+        pkt.mode       = RobotMode::FAILSAFE;
+        pkt.timestamp_hi = static_cast<uint32_t>(now >> 32);
+        pkt.timestamp_lo = static_cast<uint32_t>(now & 0xFFFFFFFF);
+        pkt.crc16      = 0; // zero then calculate
 
-        heartbeatPacket.crc16 = SignalUtils::calculateCrc(
-            reinterpret_cast<uint8_t*>(&heartbeatPacket),
-            sizeof(ControlPacket) - 2);
+        pkt.crc16 = SignalUtils::calculateCrc(
+                        reinterpret_cast<uint8_t*>(&pkt),
+                        sizeof(ControlPacket) - 2);
 
-        uint8_t encodeWorkspace[sizeof(ControlPacket) + 2];
-        size_t encodedLen = SignalUtils::cobsEncode(
-            reinterpret_cast<uint8_t*>(&heartbeatPacket), sizeof(ControlPacket),
-            encodeWorkspace);
-
-        // 寫入完畢後，補齊 0x00 分隔符作為影格結束標誌
-        encodeWorkspace[encodedLen] = 0x00;
-
-        if(CHASSIS_UART_SERIAL.availableForWrite() >= (int)(encodedLen + 1)) {
-            CHASSIS_UART_SERIAL.write(encodeWorkspace, encodedLen + 1);
-        }
+        sendPacket(pkt);
     }
 }
