@@ -1,0 +1,172 @@
+;
+; ultrasonic_echo.pio
+;
+; PIO program for HC-SR04 / US-100 ultrasonic echo pulse width measurement.
+;
+; Each PIO state machine monitors one echo pin (GPIO Trigger/Echo mode).
+; Protocol per measurement cycle:
+;   1. C++ sets the Trigger pin HIGH for >=10us, then LOW
+;   2. C++ pushes a word to SM TX FIFO → SM unblocks from pull
+;   3. SM waits for echo rising edge
+;   4. SM counts 2-cycle intervals until echo falling edge
+;   5. SM pushes 32-bit count to RX FIFO
+;   6. SM waits at pull block for next C++ trigger
+;
+; Distance conversion (C++ side):
+;   elapsed_loops = ~remaining_X   (complement of the remaining counter)
+;   time_ns = elapsed_loops * 2 * (1e9 / F_SYS)
+;   dist_mm = time_ns * 343e-6 / 2    (speed of sound round-trip)
+;
+; PIO resource usage: 1 SM per sensor, 7 instructions
+; RP2350: 2 PIO × 4 SM = 8 SM maximum
+;
+; Per-agent.md conventions:
+;   - Instruction delays [n] never exceed 31 cycles
+;   - Only microsecond-level timing in PIO; millisecond delays handled by C++ HW timer
+;   - Non-32-bit multiple data: manual push (no autopush)
+;   - Cycle-count comments on each block
+;
+
+.program ultrasonic_echo
+
+; === Main measurement loop ===
+; Total instructions: 7 — fits easily within RP2350 32-instruction limit per SM.
+;
+; Wrap range: .wrap_target (0) to .wrap (6)
+; Instructions 0-6 form the main loop.  Timeout handler is OUTSIDE wrap
+; so it doesn't get auto-wrapped — we jump to it explicitly.
+;
+; NOTE on wrap edge-case (fix for agent.md §PIO開發規則):
+;   The timeout path (instructions 7-9) is placed AFTER .wrap so the main
+;   loop auto-wraps from `push` back to `pull block`.  On timeout,
+;   `jmp 7` escapes the wrap region, executes mov+push with explicit 0,
+;   then `jmp 0` re-enters the main loop at pull block.
+
+.wrap_target
+main_loop:
+    pull block              ; 0.  [1] Block until C++ sends trigger word (re-arm).
+
+    mov x, !NULL            ; 1.  [1] X = 0xFFFFFFFF (start count, decrements).
+
+    wait 1 pin, 0           ; 2.  [var] Wait for echo pin → HIGH (rising edge).
+                            ;     Uses IN_PINS_BASE + 0, configured per-SM.
+
+count_loop:
+    ; 2-instruction loop body: decrement X, check echo pin
+    jmp x--, echo_low       ; 3.  [1] Decrement X.  Jump if X was > 0.
+                            ;     X wrapped from 0 → timeout (fall through).
+
+    ; Timeout: X wrapped around.  Fall through to timeout handler OUTSIDE wrap.
+    jmp timeout_handler     ; 4.  [1] Jump to timeout handler at instruction 7.
+
+echo_low:
+    jmp pin count_loop      ; 5.  [1] If pin still HIGH → count more.
+                            ;     If pin LOW → measurement done.
+
+    ; Successful measurement
+    mov isr, ~x             ; 6.  [1] ISR = bitwise NOT of X = elapsed loop iterations.
+    push                    ; 7.  [1] Push 32-bit count to RX FIFO.  HW wrap to 0.
+.wrap
+
+; === Timeout handler ===
+; Placed outside wrap range so it's only entered via explicit jmp.
+; Clears ISR to 0, pushes 0 as timeout marker, returns to main loop.
+;
+; Cycle count:
+;   jmp 7 + mov isr, null + push + jmp 0 = 4 instructions (trivial overhead)
+timeout_handler:
+    mov isr, NULL           ; 8.  [1] ISR = 0 (timeout marker, distinguishable from real data).
+    push                    ; 9.  [1] Push 0 to RX FIFO.
+    jmp main_loop           ; 10. [1] Jump back to main loop at pull block.
+
+;
+; ── Cycle count summary ──
+; Normal measurement (echo present):
+;   pull + mov + wait + N*(jmp x--+jmp pin) + mov + push + hw-wrap
+;   = 3 + N*2 + 2 + 0 = 5 + 2N cycles  (N = measured 2-cycle units)
+;
+; Timeout (no echo / out of range):
+;   pull + mov + wait + jmp x--(wrap to 0) + jmp 7 + mov + push + jmp 0
+;   = 3 + 1 + 1 + 1 + 1 + 1 + 1 = 9 cycles  →  microseconds, not milliseconds!
+;   C++ will time out via HW timer and restart the SM.
+;
+
+
+; ============================================================================
+; C SDK helper functions
+; ============================================================================
+% c-sdk {
+
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+/* -------------------------------------------------------------------
+ * Initialize one PIO state machine for ultrasonic echo measurement.
+ *
+ * Parameters:
+ *   pio      — PIO block (pio0 or pio1)
+ *   sm       — State machine index (0..3)
+ *   offset   — Program offset from pio_add_program()
+ *   echoPin  — GPIO pin connected to sensor Echo
+ *
+ * Each SM gets its own IN_PINS_BASE = JMP_PIN = echoPin,
+ * so `wait 1 pin, 0` and `jmp pin` both monitor the correct pin.
+ * Clock divider set for 125 MHz (1:1).
+ * ------------------------------------------------------------------- */
+static inline void ultrasonic_echo_program_init(PIO pio, uint sm,
+                                                uint offset, uint echoPin) {
+    pio_sm_config c = ultrasonic_echo_program_get_default_config(offset);
+
+    /* Must assign GPIO to PIO, otherwise PIO reads garbage level */
+    pio_gpio_init(pio, echoPin);
+
+    /* Map IN pin base: used by `wait 1 pin, 0` with pin index 0 */
+    sm_config_set_in_pins(&c, echoPin);
+    /* Map JMP pin: used by `jmp pin` — must match IN pin */
+    sm_config_set_jmp_pin(&c, echoPin);
+    /* Set IN shift: shift left, autopush disabled; manual push only */
+    sm_config_set_in_shift(&c, false, false, 32);
+    /* Disable autopull — we use manual pull for re-arm triggers */
+    sm_config_set_out_shift(&c, false, false, 32);
+    /* Clock divider: 1:1 (full 125 MHz sysclk) */
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+/* -------------------------------------------------------------------
+ * Send re-arm word to trigger one SM measurement cycle.
+ * ------------------------------------------------------------------- */
+static inline void ultrasonic_echo_trigger(PIO pio, uint sm) {
+    pio_sm_put_blocking(pio, sm, 0);
+}
+
+/* -------------------------------------------------------------------
+ * Read measurement result from one SM (non-blocking).
+ * Returns true if data available.
+ * ------------------------------------------------------------------- */
+static inline bool ultrasonic_echo_read(PIO pio, uint sm,
+                                        uint32_t* count,
+                                        bool* timedOut) {
+    if (pio_sm_is_rx_fifo_empty(pio, sm))
+        return false;
+
+    *count = pio_sm_get(pio, sm);
+    *timedOut = (*count == 0);
+    return true;
+}
+
+/* -------------------------------------------------------------------
+ * Force-restart one SM (used after a hardware timeout).
+ * ------------------------------------------------------------------- */
+static inline void ultrasonic_echo_reset(PIO pio, uint sm, uint offset) {
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_clear_fifos(pio, sm);
+    pio_sm_restart(pio, sm);
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset));
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}

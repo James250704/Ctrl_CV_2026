@@ -1,16 +1,16 @@
 // ============================================================================
-// Shoot — Slave node (RP2350)
+// Shoot — Slave 節點 (RP2350)
 //
-// Per agent.md topology:
-//   Hub(Shoot) ↔ Shoot：PIO UART (SM1), 921600 baud, COBS framing
+// 根據 agent.md 拓撲：
+//   Hub(Shoot) ↔ Shoot：PIO UART (SM1), 921600 baud, COBS 封幀
 //
-// Core allocation (agent.md §核心分配):
-//   Core 0 (loop):   PIO UART RX/TX → COBS → CRC → notify Core 1
-//   Core 1 (loop1):  Triggered by Core 0 → execute BLDC / stepper control
+// 核心分配（agent.md §核心分配）：
+//   Core 0 (loop)：   PIO UART 收發 → COBS → CRC → 通知 Core 1
+//   Core 1 (loop1)：  由 Core 0 觸發 → 執行 BLDC / 步進馬達控制
 //
-// Core 1 sync pattern (agent.md §核心間同步機制):
-//   Core 0 writes SlaveCommand to lock-free double-buffer with release store
-//   Core 1 spinloops with acquire load, memcpy snapshot, executes, loops back
+// Core 1 同步模式（agent.md §核心間同步機制）：
+//   Core 0 以 release store 寫入 SlaveCommand 至無鎖雙緩衝區
+//   Core 1 以 acquire load 自旋等待，memcpy 快照，執行，迴圈
 // ============================================================================
 #include "signal_shared.h"
 #include <Arduino.h>
@@ -18,7 +18,7 @@
 #include <hardware/uart.h>
 
 // ============================================================================
-// Core 0 ↔ Core 1 lock-free command buffer (agent.md §核心間通訊)
+// Core 0 ↔ Core 1 無鎖命令緩衝區（agent.md §核心間通訊）
 // ============================================================================
 static struct SlaveCommand {
     ChassisSnapshot snapshot;
@@ -28,28 +28,28 @@ static std::atomic<uint8_t> cmdWriteIdx{0};
 static std::atomic<bool>    estopActive{false};
 
 // ============================================================================
-// PIO UART state (placeholder — PIO SM1 will be configured here)
-// Per agent.md: Slaves use PIO UART, not hardware UART peripherals.
+// PIO UART 狀態（佔位 — PIO SM1 將在此處配置）
+// 根據 agent.md：Slaves 使用 PIO UART，非硬體 UART 週邊。
 // ============================================================================
 static constexpr uint8_t PIO_SLAVE_TX_PIN = 16; // GP16 (TBD — per hub ↔ slave pinout)
 static constexpr uint8_t PIO_SLAVE_RX_PIN = 17; // GP17 (TBD)
 
-// COBS scan state — .bss allocated, no heap
+// COBS 掃描狀態 — .bss 分配，無堆疊使用
 static uint8_t parseWorkBuf[512];
 static size_t  workBufIdx    = 0;
 static uint8_t lastFrameSeq  = 0;
 static bool    firstFrame    = true;
 
-// E-Stop timeout tracking
+// E-Stop 逾時追蹤
 static uint64_t lastValidCmdTime = 0;
 static bool     motorPowerOn     = false;
 
-// Heartbeat
+// 心跳
 static uint64_t lastHeartbeatTime = 0;
 
 // ============================================================================
-// Forward declarations for Core 1 PIO motor control
-// Stubs — replace with real MotorControl library once available.
+// 前向宣告 — Core 1 PIO 馬達控制
+// 樁模組 — 待取得實際馬達函式庫後替換。
 // ============================================================================
 namespace MotorControl {
 void init() { /* TODO: init PIO PWM / encoder */ }
@@ -58,7 +58,7 @@ void estop() { /* TODO: zero all PWM */ }
 } // namespace MotorControl
 
 // ============================================================================
-// Core 0: Process a fully decoded + CRC-verified COBS frame
+// Core 0：處理已完整解碼且通過 CRC 驗證的 COBS 幀
 // ============================================================================
 static void processCommand(const ControlPacket& pkt) {
     if (!firstFrame && pkt.frameSeq == lastFrameSeq)
@@ -84,7 +84,7 @@ static void processCommand(const ControlPacket& pkt) {
 }
 
 // ============================================================================
-// Core 0: Process E-Stop from Hub
+// Core 0：處理來自 Hub 的 E-Stop
 // ============================================================================
 static void processEStop(const ControlPacket& pkt) {
     (void)pkt;
@@ -101,7 +101,7 @@ static void processEStop(const ControlPacket& pkt) {
 }
 
 // ============================================================================
-// Core 0: PIO UART receive wrapper (placeholder)
+// Core 0：PIO UART 接收包裝函式（佔位）
 // ============================================================================
 static size_t pioUartReadBytes(uint8_t* buf, size_t maxLen) {
     (void)buf;
@@ -110,7 +110,7 @@ static size_t pioUartReadBytes(uint8_t* buf, size_t maxLen) {
 }
 
 // ============================================================================
-// Core 0: PIO UART send wrapper (placeholder)
+// Core 0：PIO UART 發送包裝函式（佔位）
 // ============================================================================
 static void pioUartSendBytes(const uint8_t* buf, size_t len) {
     (void)buf;
@@ -118,7 +118,7 @@ static void pioUartSendBytes(const uint8_t* buf, size_t len) {
 }
 
 // ============================================================================
-// Core 0: COBS scan pass — each loop() iteration
+// Core 0：COBS 掃描 — 每次 loop() 迭代
 // ============================================================================
 static void processPioUartRx() {
     uint8_t rawBuf[64];
@@ -159,7 +159,7 @@ static void processPioUartRx() {
 }
 
 // ============================================================================
-// Core 0: Send heartbeat upstream to Hub
+// Core 0：向上游 Hub 發送心跳
 // ============================================================================
 static void sendHeartbeat() {
     uint64_t now = time_us_64();
@@ -198,7 +198,7 @@ static void sendHeartbeat() {
 }
 
 // ============================================================================
-// Core 0: E-Stop timeout checker (agent.md §指令超時保護)
+// Core 0：逾時檢查（agent.md §指令超時保護）
 // ============================================================================
 static void checkTimeout() {
     if (!motorPowerOn) return;
@@ -219,12 +219,12 @@ static void checkTimeout() {
 }
 
 // ============================================================================
-// Core 0: setup()
+// Core 0：setup()
 // ============================================================================
 void setup() {
-    // CRC table is compile-time const — no init needed.
+    // CRC 表為編譯期常數 — 無需初始化。
 
-    // TODO: Initialize PIO SM1 for UART TX/RX
+    // TODO：初始化 PIO SM1 作為 UART 收發
     //   pio_sm_claim(pio0, 1);
     //   pio_add_program(pio0, &cobs_uart_program);
     //   cobs_uart_program_init(pio0, 1, PIO_SLAVE_TX_PIN, PIO_SLAVE_RX_PIN, 921600);
@@ -234,7 +234,7 @@ void setup() {
 }
 
 // ============================================================================
-// Core 0: loop()
+// Core 0：loop()
 // ============================================================================
 void loop() {
     processPioUartRx();
@@ -244,7 +244,7 @@ void loop() {
 }
 
 // ============================================================================
-// Core 1: setup1()
+// Core 1：setup1()
 // ============================================================================
 void setup1() {
     MotorControl::init();
@@ -252,7 +252,7 @@ void setup1() {
 }
 
 // ============================================================================
-// Core 1: loop1() — Spinloop waiting for Core 0 commands
+// Core 1：loop1() — 自旋等待 Core 0 的命令
 // ============================================================================
 void loop1() {
     while (true) {

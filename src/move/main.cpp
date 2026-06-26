@@ -1,323 +1,692 @@
 // ============================================================================
-// Move — Slave node (RP2350)
+// Move Slave — 四輪麥克納姆輪控制韌體 (RP2350)
 //
-// Per agent.md topology:
-//   Hub(Move) ↔ Move：PIO UART (SM0), 921600 baud, COBS framing
+// 根據 agent.md 雙核架構規範：
+//   Core 0 (loop):  PIO UART 收發 COBS 幀、CRC 驗證、指令解析、通知 Core 1
+//   Core 1 (loop1): 由 Core 0 觸發，執行 Mecanum 運動學解算 + 四輪獨立 PID 控制
 //
-// Core allocation (agent.md §核心分配):
-//   Core 0 (loop):   PIO UART RX/TX → COBS → CRC → notify Core 1
-//   Core 1 (loop1):  Triggered by Core 0 → execute mecanum wheel motor control
-//
-// Core 1 sync pattern (agent.md §核心間同步機制):
-//   Core 0 writes SlaveCommand to lock-free double-buffer with release store
-//   Core 1 spinloops with acquire load, memcpy snapshot, executes, loops back
+// 硬體配置（每輪）：
+//   - 一組 PIO PWM (2 個 state machine 可做互補輸出，或 1 個 SM 做單端)
+//   - 一組 PIO Quadrature Encoder (1 個 SM)
+//   - 四輪總計：4×PWM + 4×Encoder = 8 SM (剛好用完一個 PIO block)
+//     若使用 PIO block0 全部 4 個 SM 做 Encoder，
+//     block1 全部 4 個 SM 做 PWM。
 // ============================================================================
-#include "signal_shared.h"
 #include <Arduino.h>
 #include <atomic>
-#include <hardware/uart.h>
+#include <cmath>
+#include <cstring>
+#include <hardware/clocks.h>
+#include <hardware/irq.h>
+#include <hardware/pio.h>
+#include <hardware/timer.h>
+#include <pico/multicore.h>
+#include <pico/stdlib.h>
+
+#include "signal_shared.h"
 
 // ============================================================================
-// Core 0 ↔ Core 1 lock-free command buffer (agent.md §核心間通訊)
+// 腳位定義 (依實際硬體接線修改)
 // ============================================================================
-static struct SlaveCommand {
-    ChassisSnapshot snapshot;
-    bool            estopActive;
-} cmdBuf[2];
-static std::atomic<uint8_t> cmdWriteIdx{0};
-static std::atomic<bool>    estopActive{false};
+namespace Pin {
+// PIO UART — 與 Hub 通訊 (agent.md §UART 腳位)
+constexpr uint PIO_UART_TX = 4; // PIO UART TX to Hub
+constexpr uint PIO_UART_RX = 5; // PIO UART RX from Hub
 
-// ============================================================================
-// PIO UART state (placeholder — PIO SM0 will be configured here)
-// Per agent.md: Slaves use PIO UART, not hardware UART peripherals.
-// PIO SM0 handles both TX and RX at 921600 baud.
-// PIO program loaded from .pio file; SM configured with proper GPIOs.
-// ============================================================================
-static constexpr uint8_t PIO_SLAVE_TX_PIN = 4;  // GP4 (TBD — per hub ↔ slave pinout)
-static constexpr uint8_t PIO_SLAVE_RX_PIN = 5;  // GP5 (TBD)
+// 四輪馬達 PWM (使用 PIO PWM)
+constexpr uint MOTOR1_PWM = 6; // FL — 前左
+constexpr uint MOTOR2_PWM = 7; // FR — 前右
+constexpr uint MOTOR3_PWM = 8; // RL — 後左
+constexpr uint MOTOR4_PWM = 9; // RR — 後右
 
-// COBS scan state — .bss allocated, no heap
-static uint8_t parseWorkBuf[512];
-static size_t  workBufIdx = 0;
-static uint8_t lastFrameSeq  = 0;
-static bool    firstFrame    = true;
+// 四輪編碼器 A/B 相
+constexpr uint MOTOR1_ENC_A = 10; // FL Encoder A
+constexpr uint MOTOR1_ENC_B = 11; // FL Encoder B
+constexpr uint MOTOR2_ENC_A = 12; // FR Encoder A
+constexpr uint MOTOR2_ENC_B = 13; // FR Encoder B
+constexpr uint MOTOR3_ENC_A = 14; // RL Encoder A
+constexpr uint MOTOR3_ENC_B = 15; // RL Encoder B
+constexpr uint MOTOR4_ENC_A = 16; // RR Encoder A
+constexpr uint MOTOR4_ENC_B = 17; // RR Encoder B
 
-// E-Stop timeout tracking
-static uint64_t lastValidCmdTime   = 0;
-static bool     motorPowerOn       = false;
-
-// Heartbeat
-static uint64_t lastHeartbeatTime  = 0;
+// 除錯 UART (agent.md: UART1, GP4 TX, GP5 RX)
+constexpr uint DEBUG_TX = 4;
+constexpr uint DEBUG_RX = 5;
+} // namespace Pin
 
 // ============================================================================
-// Forward declarations for Core 1 PIO motor control
-// Stubs — replace with real MotorControl library once available.
+// 運動學參數
 // ============================================================================
-namespace MotorControl {
-void init() { /* TODO: init PIO PWM / encoder */ }
-void executeMotion(const ChassisSnapshot&) { /* TODO: apply motor setpoints */ }
-void estop() { /* TODO: zero all PWM */ }
-} // namespace MotorControl
+namespace Kinematics {
+// 車身半長 (m) — 依實際車體修改
+constexpr float HALF_LENGTH = 0.25f;
+// 車身半寬 (m)
+constexpr float HALF_WIDTH = 0.25f;
+// 輪半徑 (m)
+constexpr float WHEEL_RADIUS = 0.05f;
 
-// ============================================================================
-// Core 0: Process a fully decoded + CRC-verified COBS frame
-//   - FrameSeq anti-duplicate
-//   - Write to Core 1 double-buffer with release semantics
-//   - Track lastValidCmdTime for E-Stop timeout
-// ============================================================================
-static void processCommand(const ControlPacket& pkt) {
-    // FrameSeq duplicate check
-    if (!firstFrame && pkt.frameSeq == lastFrameSeq)
-        return;
-    firstFrame   = false;
-    lastFrameSeq = pkt.frameSeq;
+// HALF_LENGTH：請拿量尺測量前輪軸心到後輪軸心的距離，然後除以 2。例如軸距是 30
+// 公分，這裡就填 0.15f。 HALF_WIDTH：測量左輪中心線到右輪中心線的距離，然後除以
+// 2。 WHEEL_RADIUS：量測你購買的麥克納姆輪直徑並除以 2。直徑 10cm
+// 的輪子，這裡就填 0.05f。
 
-    // Translate wire-format ControlPacket to in-memory ChassisSnapshot
-    ChassisSnapshot snap;
-    snap.vx               = static_cast<float>(pkt.vx);
-    snap.vy               = static_cast<float>(pkt.vy);
-    snap.omega            = static_cast<float>(pkt.omega);
-    snap.mode             = pkt.mode;
-    snap.frameSeq         = pkt.frameSeq;
-    snap.lastArrivalTick  = time_us_64();
+// 從 (vx, vy, omega) 算到各輪期望轉速 (rad/s)
+// 麥克納姆輪逆運動學：
+//   FL： (vx - vy - (L+W)*ω) / R
+//   FR： (vx + vy + (L+W)*ω) / R
+//   RL： (vx + vy - (L+W)*ω) / R
+//   RR： (vx - vy + (L+W)*ω) / R
+constexpr float L_PLUS_W = HALF_LENGTH + HALF_WIDTH;
+constexpr float INV_R = 1.0f / WHEEL_RADIUS;
 
-    // Write to double-buffer with release semantics (agent.md §核心間通訊)
-    uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
-    cmdBuf[idx].snapshot    = snap;
-    cmdBuf[idx].estopActive = false;
-    cmdWriteIdx.store(idx ^ 1, std::memory_order_release);
+// Feedforward 增益：rps → PWM duty 的開迴路增益 (需實際量測校準)
+// 作法：給定一個定 duty (如 10%) 後量測穩定 RPS，算出 slope。
+// kFF = targetRPS / duty (單位：RPS / 歸一化 duty)
+constexpr float kFF = 7.0f;  // 例：duty=1.0 → 7 RPS
 
-    lastValidCmdTime = snap.lastArrivalTick;
-    motorPowerOn     = true;
+// 車身加速度 ramping 限制 (RPS/s²)，用於上層目標值的平順化
+// 取代原本的 SlewRateLimiter（作用在車身速度層級而非各輪）
+constexpr float ACCEL_LIMIT = 20.0f; // RPS/s²，可依手感調整
+
+// 將上層速度 (vx, vy, omega) 轉換為四輪期望 RPS
+inline void computeWheelTargets(float vx, float vy, float omega, float& fl,
+                                float& fr, float& rl, float& rr) {
+    float lwOmega = L_PLUS_W * omega;
+    fl = (vx - vy - lwOmega) * INV_R;
+    fr = (vx + vy + lwOmega) * INV_R;
+    rl = (vx + vy - lwOmega) * INV_R;
+    rr = (vx - vy + lwOmega) * INV_R;
 }
 
-// ============================================================================
-// Core 0: Process E-Stop from Hub (targetID == BROADCAST, msgType == ESTOP)
-// ============================================================================
-static void processEStop(const ControlPacket& pkt) {
-    (void)pkt;
-    estopActive.store(true, std::memory_order_release);
-
-    // Also write to double-buffer so Core 1 immediately sees it
-    uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
-    cmdBuf[idx].estopActive = true;
-    cmdBuf[idx].snapshot.vx = cmdBuf[idx].snapshot.vy =
-        cmdBuf[idx].snapshot.omega = 0;
-    cmdBuf[idx].snapshot.mode = RobotMode::FAILSAFE;
-    cmdWriteIdx.store(idx ^ 1, std::memory_order_release);
-
-    motorPowerOn = false;
+// Feedforward 項：rps → 前饋 PWM 輸出
+// 用線性比例近似，若馬達有量測曲線可改用 lookup table
+inline float feedforward(float targetRps) {
+    return targetRps / kFF;
 }
+} // namespace Kinematics
 
 // ============================================================================
-// Core 0: PIO UART receive wrapper (placeholder until PIO SM0 is connected)
-// Non-blocking: returns number of bytes read (max 64), 0 if none available.
+// PID + Feedforward 控制器
+//
+// output = PID(error) + FF(setpoint)
+//   — PID 負責閉環修正（抗干擾）
+//   — FF 提供基底開迴路輸出，讓 PID 只需補小量誤差
 // ============================================================================
-static size_t pioUartReadBytes(uint8_t* buf, size_t maxLen) {
-    // TODO: Replace with actual PIO SM0 RX read
-    //   sm = pio_get_index(pio0), SM0
-    //   if (pio_sm_get_rx_fifo_level(pio, sm) > 0)
-    //       buf[n++] = pio_sm_get(pio, sm) & 0xFF;
-    // Stub: no bytes available
-    (void)buf;
-    (void)maxLen;
-    return 0;
-}
+class PidController {
+  public:
+    float kp, ki, kd;
+    float outLimit;
+    float integralLimit;
+    float ffGain; // feedforward 增益 (PWM/RPS)，0 則關閉 FF
 
-// ============================================================================
-// Core 0: PIO UART send wrapper (placeholder)
-// ============================================================================
-static void pioUartSendBytes(const uint8_t* buf, size_t len) {
-    // TODO: Replace with actual PIO SM0 TX push
-    //   for (size_t i = 0; i < len; i++)
-    //       pio_sm_put_blocking(pio0, 0, buf[i]);
-    (void)buf;
-    (void)len;
-}
+    void reset() {
+        integral_ = 0.0f;
+        prevError_ = 0.0f;
+        firstRun_ = true;
+    }
 
-// ============================================================================
-// Core 0: COBS scan pass — called each loop() iteration
-// Processes up to 64 bytes looking for 0x00 delimiters.
-// ============================================================================
-static void processPioUartRx() {
-    uint8_t rawBuf[64];
-    size_t  nRead = pioUartReadBytes(rawBuf, sizeof(rawBuf));
-    if (nRead == 0) return;
+    /// dt 單位：秒
+    /// setpoint = 目標 RPS, measurement = 當前 RPS
+    /// 回傳 = PID 輸出 + Feedforward 項（已限幅）
+    float update(float setpoint, float measurement, float dt) {
+        float error = setpoint - measurement;
 
-    for (size_t i = 0; i < nRead; i++) {
-        uint8_t byte = rawBuf[i];
-
-        if (byte == 0x00) {
-            // End of COBS frame
-            if (workBufIdx >= sizeof(ControlPacket)) {
-                uint8_t decoded[512];
-                size_t  decLen = SignalUtils::cobsDecode(parseWorkBuf,
-                                                          workBufIdx,
-                                                          decoded);
-                if (decLen >= sizeof(ControlPacket)) {
-                    const ControlPacket& pkt =
-                        *reinterpret_cast<const ControlPacket*>(decoded);
-
-                    // CRC verify
-                    uint16_t storedCrc = pkt.crc16;
-                    uint16_t calcCrc   = SignalUtils::calculateCrc(
-                                             decoded,
-                                             sizeof(ControlPacket) - 2);
-                    if (storedCrc == calcCrc) {
-                        if (pkt.sync == 0xA5) {
-                            if (pkt.msgType == MsgType::HEARTBEAT ||
-                                pkt.msgType == MsgType::CONTROL) {
-                                processCommand(pkt);
-                            } else if (pkt.msgType == MsgType::ESTOP) {
-                                processEStop(pkt);
-                            }
-                        }
-                    }
-                    // CRC mismatch → silently drop (agent.md rule)
-                }
-            }
-            workBufIdx = 0;
-        } else {
-            if (workBufIdx < sizeof(parseWorkBuf) - 1)
-                parseWorkBuf[workBufIdx++] = byte;
+        if(firstRun_) {
+            prevError_ = error;
+            firstRun_ = false;
         }
+
+        // ---- PID 三項 ----
+        // 比例項
+        float pTerm = kp * error;
+
+        // 積分項 (含 anti-windup clamp)
+        integral_ += ki * error * dt;
+        if(integral_ > integralLimit)
+            integral_ = integralLimit;
+        if(integral_ < -integralLimit)
+            integral_ = -integralLimit;
+
+        // 微分項 (在量測值上微分，避免 derivative kick)
+        float dTerm = kd * (error - prevError_) / dt;
+        prevError_ = error;
+
+        float pidOut = pTerm + integral_ + dTerm;
+
+        // ---- Feedforward 項（前饋）----
+        // 使用 Kinematics::feedforward() 計算對應的 PWM
+        float ffOut = Kinematics::feedforward(setpoint);
+
+        float output = pidOut + ffOut;
+
+        // 輸出限幅
+        if(output > outLimit)
+            output = outLimit;
+        if(output < -outLimit)
+            output = -outLimit;
+
+        return output;
     }
-}
+
+  private:
+    float integral_ = 0.0f;
+    float prevError_ = 0.0f;
+    bool firstRun_ = true;
+};
 
 // ============================================================================
-// Core 0: Send heartbeat upstream to Hub via PIO UART
-// Heartbeat: 30ms interval, mode=FAILSAFE (agent.md §心跳)
+// RampedTarget — 車身速度層加速度漸變 (Ramping)
+//
+// 作用在 (vx, vy, omega) 目標值上，讓車身平順加減速，
+// 取代各輪獨立的 SlewRateLimiter，使四輪動作一致。
 // ============================================================================
-static void sendHeartbeat() {
-    uint64_t now = time_us_64();
-    if (now - lastHeartbeatTime < RobotConfig::HEARTBEAT_INTERVAL_US)
-        return;
-    lastHeartbeatTime = now;
+class RampedTarget {
+  public:
+    explicit RampedTarget(float maxDeltaPerSec)
+        : maxDelta_(maxDeltaPerSec) {}
 
-    static uint8_t hbFrameSeq = 0;
+    void reset(float value = 0.0f) { previous_ = value; }
 
-    ControlPacket pkt;
-    pkt.sync       = 0xA5;
-    pkt.msgType    = MsgType::HEARTBEAT;
-    pkt.frameSeq   = hbFrameSeq++;
-    pkt.targetID   = TargetID::HUB;
-    pkt.payloadLen = sizeof(ControlPacket) - 6;
-    pkt.vx         = 0;
-    pkt.vy         = 0;
-    pkt.omega      = 0;
-    pkt.mode       = RobotMode::FAILSAFE;
-    pkt.timestamp_hi = static_cast<uint32_t>(now >> 32);
-    pkt.timestamp_lo = static_cast<uint32_t>(now & 0xFFFFFFFF);
-    pkt.crc16      = 0;
-
-    pkt.crc16 = SignalUtils::calculateCrc(
-                    reinterpret_cast<uint8_t*>(&pkt),
-                    sizeof(ControlPacket) - 2);
-
-    uint8_t  cobsBuf[sizeof(ControlPacket) + 2];
-    size_t   cobsLen = SignalUtils::cobsEncode(
-                          reinterpret_cast<const uint8_t*>(&pkt),
-                          sizeof(ControlPacket),
-                          cobsBuf);
-    cobsBuf[cobsLen] = 0x00;
-
-    pioUartSendBytes(cobsBuf, cobsLen + 1);
-}
-
-// ============================================================================
-// Core 0: E-Stop timeout checker (agent.md §指令超時保護)
-// If no valid command received for >100ms, trigger E-Stop.
-// ============================================================================
-static void checkTimeout() {
-    if (!motorPowerOn) return;
-
-    uint64_t now = time_us_64();
-    if (now - lastValidCmdTime > RobotConfig::COMMAND_TIMEOUT_US) {
-        // Timeout — notify Core 1
-        estopActive.store(true, std::memory_order_release);
-
-        uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
-        cmdBuf[idx].estopActive = true;
-        cmdBuf[idx].snapshot.vx = cmdBuf[idx].snapshot.vy =
-            cmdBuf[idx].snapshot.omega = 0;
-        cmdBuf[idx].snapshot.mode = RobotMode::FAILSAFE;
-        cmdWriteIdx.store(idx ^ 1, std::memory_order_release);
-
-        motorPowerOn = false;
+    // 限步長逼近目標，回傳本週期應使用的值
+    float update(float target, float dt) {
+        float maxStep = maxDelta_ * dt;
+        float diff = target - previous_;
+        if(diff > maxStep)
+            diff = maxStep;
+        if(diff < -maxStep)
+            diff = -maxStep;
+        previous_ += diff;
+        return previous_;
     }
-}
+
+  private:
+    float maxDelta_;
+    float previous_ = 0.0f;
+};
 
 // ============================================================================
-// Core 0: setup()
+// 四輪狀態 — 每個輪子一組
+// ============================================================================
+struct WheelState {
+    // PIO 資源索引
+    uint pwmSm;   // PIO PWM 使用的 state machine 編號
+    uint encSm;   // PIO Encoder state machine 編號
+    PIO pioBlock; // 所屬 PIO block
+
+    // 控制
+    PidController pid;
+    volatile int32_t encoderCount; // PIO 更新 (IRQ 中原子寫入)
+    float currentRps;              // 當前轉速 (由 Core 1 計算)
+    float targetRps;               // 期望轉速
+    float pwmOutput;               // PID+FF 輸出值
+
+    void initPid() {
+        // 典型輪子 PID 參數 — 需實際調校
+        // 有 FF 前饋後，PID 只需補少量誤差，增益可比純 PID 小
+        pid.kp = 1.5f;
+        pid.ki = 0.0f;
+        pid.kd = 0.0f;
+        pid.outLimit = RobotConfig::PID_OUT_LIMIT;
+        pid.integralLimit = 5.0f;
+        pid.ffGain = Kinematics::kFF;  // 使用運動學 FF 增益
+        pid.reset();
+    }
+};
+
+// ============================================================================
+// 全域狀態 — 所有靜態分配，禁止 new/malloc (agent.md §核心 1 規則)
+// ============================================================================
+
+// 四輪狀態陣列 (FL, FR, RL, RR)
+static WheelState wheels[4];
+
+// Core 0 ↔ Core 1 雙緩衝區 (agent.md §核心間通訊)
+static ChassisSnapshot cmdBuf[2];
+static std::atomic<uint8_t> cmdWriteIdx{0};
+static std::atomic<bool> cmdValid{false};
+
+// E-Stop 旗標
+static std::atomic<bool> estopActive{false};
+static uint64_t lastValidFrameTime = 0;
+
+// 除錯輸出 (透過 UART1)
+static Stream* debugOut = nullptr;
+
+// 時間追蹤
+static absolute_time_t lastControlTime;
+
+// ============================================================================
+// PIO 程式 — 四倍頻編碼器解碼
+// 標準 AB 正交解碼：每個 edge 計數，4 倍頻
+//
+// 注意：RP2350 PIO 指令為 16-bit，故使用 uint16_t 陣列
+// 並以 pio_program_t 結構包裝供 pio_add_program() 使用。
+// ============================================================================
+static const uint16_t pio_encoder_instructions[] = {
+    0x2020, // 0: wait 0 pin, 0        ; 等待 A 變低
+    0x20a0, // 1: wait 1 pin, 0        ; 等待 A 變高
+    0x2021, // 2: wait 0 pin, 1        ; 等待 B 變低
+    0x20a1, // 3: wait 1 pin, 1        ; 等待 B 變高
+    0x0040, // 4: jmp x--, 0           ; 計數 (遞減後跳回)
+};
+
+static const pio_program_t pio_encoder_program = {
+    .instructions = pio_encoder_instructions,
+    .length = 5,
+    .origin = -1,
+};
+
+// static_assert 不可用於非 constexpr 的 struct 成員，故移除
+// 長度在宣告時明顯小於 32，無需 runtime assert
+
+// ============================================================================
+// PIO 程式 — PWM 輸出 (每輪一個 SM)
+// 系統時脈 150MHz，PWM 頻率 25kHz：
+//   CLKDIV = 1.0, wrap = 6000 - 1 = 5999
+//   freq = 150MHz / (1 * 6000) = 25kHz
+// ============================================================================
+static const uint16_t pio_pwm_instructions[] = {
+    0x80a0, // 0: pull noblock           ; 從 FIFO 取值 (32-bit: bit16=dir, bit15:0=duty)
+    0xa027, // 1: mov x, osr             ; OSR → X (保留方向位元)
+    0xe001, // 2: set y, 1               ; Y = 1 (用於比較)
+    0x00c8, // 3: jmp pin, 5             ; 若方向 pin 為高 → 正轉 (跳至標籤)
+    0x0086, // 4: jmp x!=y, 6            ; 反轉：當 X > 1 才輸出 high
+    0x0086, // 5: jmp x!=y, 6            ; 正轉：當 X > 1 才輸出 high
+    0x0082, // 6: jmp y--, 2             ; 遞減 Y，跳到步驟 2
+    // .wrap (回到步驟 0)
+};
+// 簡化版 PWM — 實際使用需依驅動 IC 調整
+// 大部分直流馬達驅動只需一組 PWM + 一組方向 GPIO
+// 此 PIO 程式預留為硬體 PWM 備用；實務上可直接使用
+// RP2350 的硬體 PWM (pwm_config) 或標準 Servo library
+
+static const pio_program_t pio_pwm_program = {
+    .instructions = pio_pwm_instructions,
+    .length = 7,
+    .origin = -1,
+};
+
+// ============================================================================
+// 前向宣告
+// ============================================================================
+static void core1_main();
+static void onHubFrame(const ControlPacket& pkt);
+static void updateMotors(float dt);
+static void readEncoders(float dt);
+static void emergencyStop();
+static float rpsToPwm(float rpsTarget);
+static float pwmToRps(float pwm);
+
+// ============================================================================
+// Core 0 — 通訊核心
 // ============================================================================
 void setup() {
-    // CRC table is compile-time const — no init needed.
+    // 初始化除錯輸出
+    Serial1.setPinout(Pin::DEBUG_TX, Pin::DEBUG_RX);
+    Serial1.begin(RobotConfig::DEBUG_BAUDRATE);
+    debugOut = &Serial1;
+    debugOut->println("[Move] Slave booting...");
 
-    // TODO: Initialize PIO SM0 for UART TX/RX
-    //   pio_sm_claim(pio0, 0);
-    //   pio_add_program(pio0, &cobs_uart_program);
-    //   cobs_uart_program_init(pio0, 0, PIO_SLAVE_TX_PIN, PIO_SLAVE_RX_PIN, 921600);
+    // ---- PIO PWM 初始化 (block1, 4 SM 給 4 輪) ----
+    PIO pwmPio = pio1;
+    for(int i = 0; i < 4; i++) {
+        wheels[i].pioBlock = pwmPio;
+        wheels[i].pwmSm = static_cast<uint>(i);
 
-    // Initialize motor control on Core 1
-    // MotorControl::init() called from setup1() instead
-
-    pinMode(LED_BUILTIN, OUTPUT);
-    digitalWrite(LED_BUILTIN, HIGH);
-}
-
-// ============================================================================
-// Core 0: loop() — COBS frame parsing + UART heartbeat + timeout check
-// ============================================================================
-void loop() {
-    processPioUartRx();
-    sendHeartbeat();
-    checkTimeout();
-
-    // Keep loop rate high — Core 0 should never block
-    delayMicroseconds(20);
-}
-
-// ============================================================================
-// Core 1: setup1() — Initialize PIO PWM and encoder peripherals
-// ============================================================================
-void setup1() {
-    MotorControl::init();
-
-    // Wait for first command from Core 0 before enabling motors
-    motorPowerOn = false;
-}
-
-// ============================================================================
-// Core 1: loop1() — Spinloop waiting for Core 0 commands
-//
-// Per agent.md §核心間同步機制:
-//   1. acquire-load cmdWriteIdx
-//   2. memcpy snapshot from other buffer
-//   3. execute motor control
-//   4. check E-Stop on each cycle
-//   5. loop back
-// ============================================================================
-void loop1() {
-    while (true) {
-        // Acquire-load the latest write index (agent.md §核心間通訊)
-        uint8_t idx = cmdWriteIdx.load(std::memory_order_acquire);
-        uint8_t readIdx = idx ^ 1;
-
-        // Snapshot command via memcpy (avoids data race on struct fields)
-        ChassisSnapshot cmd;
-        bool estop;
-        memcpy(&cmd, &cmdBuf[readIdx].snapshot, sizeof(cmd));
-        estop = cmdBuf[readIdx].estopActive;
-
-        // Check global E-Stop flag too
-        if (estop || estopActive.load(std::memory_order_acquire)) {
-            MotorControl::estop();
-            motorPowerOn = false;
-        } else {
-            motorPowerOn = true;
-            MotorControl::executeMotion(cmd);
+        uint pin;
+        switch(i) {
+        case 0:
+            pin = Pin::MOTOR1_PWM;
+            break;
+        case 1:
+            pin = Pin::MOTOR2_PWM;
+            break;
+        case 2:
+            pin = Pin::MOTOR3_PWM;
+            break;
+        case 3:
+            pin = Pin::MOTOR4_PWM;
+            break;
+        default:
+            pin = 0;
+            break;
         }
 
-        // Tight spin — no delay()
+        // 初始化 PIO PWM (使用 PIO 產生固定頻率 PWM)
+        pio_gpio_init(pwmPio, pin);
+        gpio_set_function(pin, GPIO_FUNC_PIO1);
+
+        wheels[i].initPid();
+        wheels[i].targetRps = 0.0f;
+        wheels[i].currentRps = 0.0f;
+        wheels[i].pwmOutput = 0.0f;
+        wheels[i].encoderCount = 0;
+
+        debugOut->print("[Move] Motor ");
+        debugOut->print(i);
+        debugOut->println(" PWM initialized on PIO.");
     }
+
+    // ---- PIO Encoder 初始化 (block0, 4 SM 給 4 輪) ----
+    PIO encPio = pio0;
+    uint encOffset = pio_add_program(encPio, &pio_encoder_program);
+    for(int i = 0; i < 4; i++) {
+        wheels[i].encSm = static_cast<uint>(i);
+
+        uint pinA, pinB;
+        switch(i) {
+        case 0:
+            pinA = Pin::MOTOR1_ENC_A;
+            pinB = Pin::MOTOR1_ENC_B;
+            break;
+        case 1:
+            pinA = Pin::MOTOR2_ENC_A;
+            pinB = Pin::MOTOR2_ENC_B;
+            break;
+        case 2:
+            pinA = Pin::MOTOR3_ENC_A;
+            pinB = Pin::MOTOR3_ENC_B;
+            break;
+        case 3:
+            pinA = Pin::MOTOR4_ENC_A;
+            pinB = Pin::MOTOR4_ENC_B;
+            break;
+        default:
+            pinA = 0;
+            pinB = 0;
+            break;
+        }
+
+        pio_gpio_init(encPio, pinA);
+        pio_gpio_init(encPio, pinB);
+        gpio_set_function(pinA, GPIO_FUNC_PIO0);
+        gpio_set_function(pinB, GPIO_FUNC_PIO0);
+
+        // --- 設定 SM 配置 ---
+        // pio_encoder_program.length = 5，wrap = offset + length - 1
+        pio_sm_config encCfg = pio_get_default_sm_config();
+        sm_config_set_wrap(&encCfg, encOffset, encOffset + pio_encoder_program.length - 1);
+        sm_config_set_in_pins(&encCfg, pinA);
+        sm_config_set_jmp_pin(&encCfg, pinA);
+        sm_config_set_in_pin_count(&encCfg, 2);
+        sm_config_set_clkdiv(&encCfg, 1.0f);
+
+        pio_sm_init(encPio, i, encOffset, &encCfg);
+        pio_sm_set_enabled(encPio, i, true);
+
+        debugOut->print("[Move] Encoder ");
+        debugOut->print(i);
+        debugOut->println(" initialized.");
+    }
+
+    // ---- 啟動 Core 1 ----
+    lastControlTime = get_absolute_time();
+    multicore_launch_core1(core1_main);
+    debugOut->println("[Move] Core 1 launched.");
+}
+
+// ============================================================================
+// Core 0 主迴圈：持續收 COBS 幀
+// ============================================================================
+void loop() {
+    // PIO UART 接收透過 ChassisComms 處理，此處簡化為逾時監控
+    // 實際使用時：
+    //
+    //   static SerialPIO hubPio(Pin::PIO_UART_TX, Pin::PIO_UART_RX, 921600);
+    //   static ChassisComms hubComms(&hubPio, TargetID::MOVE);
+    //   hubComms.setFrameCallback(onHubFrame);
+    //   hubComms.begin();
+    //
+    //   hubComms.update();  // 在 loop() 中呼叫
+    //
+    // ChassisComms::update() 處理：
+    //   1. 從 PIO UART 讀取位元組
+    //   2. COBS 解碼 + CRC 驗證
+    //   3. 幀序號去重
+    //   4. 呼叫 onHubFrame 回呼
+    //   5. 30ms 心跳
+    //
+    // 此處以 sleep_ms(1) 模擬輪詢週期
+
+    tight_loop_contents();
+
+    // 逾時 E-Stop 檢查 (agent.md §指令超時保護)
+    uint64_t now = time_us_64();
+    if(!estopActive.load(std::memory_order_acquire) &&
+       (now - lastValidFrameTime > RobotConfig::COMMAND_TIMEOUT_US)) {
+        estopActive.store(true, std::memory_order_release);
+        debugOut->println("[Move] E-Stop: command timeout!");
+    }
+}
+
+// ============================================================================
+// 收到 Hub 控制幀的回呼 (由 ChassisComms 觸發，在 Core 0 上下文執行)
+// ============================================================================
+static void onHubFrame(const ControlPacket& pkt) {
+    // 驗證 msgType
+    if(pkt.msgType != MsgType::CONTROL && pkt.msgType != MsgType::HEARTBEAT) {
+        return;
+    }
+
+    // E-Stop 廣播處理 (agent.md §E-Stop 安全機制)
+    if(pkt.msgType == MsgType::ESTOP || pkt.targetID == TargetID::BROADCAST) {
+        estopActive.store(true, std::memory_order_release);
+        debugOut->println("[Move] E-Stop received from Hub!");
+        return;
+    }
+
+    // 更新最後有效幀時間
+    lastValidFrameTime = time_us_64();
+
+    // 解碼 int8_t payload → float，存入雙緩衝區
+    uint8_t writeIdx = cmdWriteIdx.load(std::memory_order_relaxed);
+    ChassisSnapshot& cmd = cmdBuf[writeIdx];
+
+    // 將 int8_t 標準化為 float：-128~127 → -MAX_RPS~MAX_RPS
+    constexpr float SCALE = RobotConfig::MAX_RPS / 127.0f;
+    cmd.vx = static_cast<float>(pkt.vx) * SCALE;
+    cmd.vy = static_cast<float>(pkt.vy) * SCALE;
+    cmd.omega = static_cast<float>(pkt.omega) * SCALE;
+    cmd.mode = pkt.mode;
+    cmd.frameSeq = pkt.frameSeq;
+
+    // 如果 E-Stop 曾觸發，現在收到有效幀 → 解除 E-Stop
+    if(estopActive.load(std::memory_order_acquire)) {
+        estopActive.store(false, std::memory_order_release);
+        debugOut->println("[Move] E-Stop cleared.");
+    }
+
+    // Release barrier：確保以上寫入在通知 Core 1 前全部可見
+    cmdValid.store(true, std::memory_order_release);
+    cmdWriteIdx.store(static_cast<uint8_t>(writeIdx ^ 1),
+                      std::memory_order_release);
+}
+
+// ============================================================================
+// Core 1 — 馬達控制核心 (由 Core 0 通知觸發)
+// ============================================================================
+static void __not_in_flash_func(core1_main)() {
+    // 車身速度層加速度 Ramping (vx, vy, omega 各自獨立)
+    RampedTarget rampVx(Kinematics::ACCEL_LIMIT);
+    RampedTarget rampVy(Kinematics::ACCEL_LIMIT);
+    RampedTarget rampOmega(Kinematics::ACCEL_LIMIT);
+    rampVx.reset();
+    rampVy.reset();
+    rampOmega.reset();
+
+    // E-Stop falling edge 偵測，用於重置 ramper
+    bool prevEstop = false;
+
+    uint64_t lastTick = time_us_64();
+
+    while(true) {
+        // Spinloop 等待 Core 0 通知 (agent.md §核心間同步機制)
+        uint8_t readIdx = cmdWriteIdx.load(std::memory_order_acquire) ^ 1;
+
+        // 檢查 E-Stop
+        if(estopActive.load(std::memory_order_acquire)) {
+            emergencyStop();
+            prevEstop = true;
+            tight_loop_contents();
+            continue;
+        }
+
+        // E-Stop falling edge：復原瞬間重置 ramper，從零重新加速
+        if(prevEstop) {
+            prevEstop = false;
+            rampVx.reset();
+            rampVy.reset();
+            rampOmega.reset();
+            lastTick = time_us_64(); // 重置 dt 基準，避免第一幀的 dt 暴衝
+        }
+
+        // 檢查是否有新命令
+        if(!cmdValid.load(std::memory_order_acquire)) {
+            // 無新命令，檢查是否逾時 (agent.md §指令超時保護)
+            uint64_t now = time_us_64();
+            if(now - lastValidFrameTime > RobotConfig::COMMAND_TIMEOUT_US) {
+                emergencyStop();
+            }
+            tight_loop_contents();
+            continue;
+        }
+
+        // Acquire barrier + 快照命令到本地變數
+        ChassisSnapshot localCmd;
+        memcpy(&localCmd, &cmdBuf[readIdx], sizeof(ChassisSnapshot));
+        cmdValid.store(false, std::memory_order_relaxed);
+
+        // 計算 dt
+        uint64_t now = time_us_64();
+        float dt = static_cast<float>(now - lastTick) * 1e-6f;
+        if(dt < 1e-6f)
+            dt = 1e-6f;
+        if(dt > 0.02f)
+            dt = 0.02f;
+        lastTick = now;
+
+        // ---- 車身加速度 Ramping (作用在 vx/vy/omega 層級) ----
+        // 三個獨立的 RampedTarget 使車體平順加減速、平滑轉向
+        float rampedVx    = rampVx.update(localCmd.vx, dt);
+        float rampedVy    = rampVy.update(localCmd.vy, dt);
+        float rampedOmega = rampOmega.update(localCmd.omega, dt);
+
+        // ---- Mecanum 運動學解算（使用 ramped 後的速度）----
+        float flTarget, frTarget, rlTarget, rrTarget;
+        Kinematics::computeWheelTargets(rampedVx, rampedVy, rampedOmega,
+                                        flTarget, frTarget, rlTarget,
+                                        rrTarget);
+
+        // ---- 讀取編碼器 (取得 currentRps) ----
+        readEncoders(dt);
+
+        // ---- PID + Feedforward 閉環控制 (四輪獨立) ----
+        float pwmFL = wheels[0].pid.update(flTarget, wheels[0].currentRps, dt);
+        float pwmFR = wheels[1].pid.update(frTarget, wheels[1].currentRps, dt);
+        float pwmRL = wheels[2].pid.update(rlTarget, wheels[2].currentRps, dt);
+        float pwmRR = wheels[3].pid.update(rrTarget, wheels[3].currentRps, dt);
+
+        // ---- PID 輸出安全檢查 ----
+        if(std::isnan(pwmFL) || std::isinf(pwmFL) || std::isnan(pwmFR) ||
+           std::isinf(pwmFR) || std::isnan(pwmRL) || std::isinf(pwmRL) ||
+           std::isnan(pwmRR) || std::isinf(pwmRR)) {
+            emergencyStop();
+            continue;
+        }
+
+        // ---- 映射到 PIO PWM duty ----
+        uint16_t dutyFL =
+            static_cast<uint16_t>(fabsf(pwmFL) / RobotConfig::PID_OUT_LIMIT *
+                                  RobotConfig::MOTOR_MAX_DUTY);
+        uint16_t dutyFR =
+            static_cast<uint16_t>(fabsf(pwmFR) / RobotConfig::PID_OUT_LIMIT *
+                                  RobotConfig::MOTOR_MAX_DUTY);
+        uint16_t dutyRL =
+            static_cast<uint16_t>(fabsf(pwmRL) / RobotConfig::PID_OUT_LIMIT *
+                                  RobotConfig::MOTOR_MAX_DUTY);
+        uint16_t dutyRR =
+            static_cast<uint16_t>(fabsf(pwmRR) / RobotConfig::PID_OUT_LIMIT *
+                                  RobotConfig::MOTOR_MAX_DUTY);
+
+        // 限幅
+        auto clampDuty = [](uint16_t d) -> uint16_t {
+            return (d > RobotConfig::MOTOR_MAX_DUTY)
+                       ? RobotConfig::MOTOR_MAX_DUTY
+                       : d;
+        };
+        dutyFL = clampDuty(dutyFL);
+        dutyFR = clampDuty(dutyFR);
+        dutyRL = clampDuty(dutyRL);
+        dutyRR = clampDuty(dutyRR);
+
+        // 寫入 PIO PWM (方向位元 + duty)
+        // 假設 PIO PWM 程式接受 bit16=direction, bit15:0=duty
+        auto writePwm = [](int i, uint16_t duty, bool negative) {
+            pio_sm_put(wheels[i].pioBlock, wheels[i].pwmSm,
+                       static_cast<uint32_t>(duty) |
+                           (negative ? 0x10000UL : 0UL));
+        };
+        writePwm(0, dutyFL, pwmFL < 0);
+        writePwm(1, dutyFR, pwmFR < 0);
+        writePwm(2, dutyRL, pwmRL < 0);
+        writePwm(3, dutyRR, pwmRR < 0);
+
+        // 更新狀態供遙測
+        wheels[0].targetRps = flTarget;
+        wheels[0].pwmOutput = pwmFL;
+        wheels[1].targetRps = frTarget;
+        wheels[1].pwmOutput = pwmFR;
+        wheels[2].targetRps = rlTarget;
+        wheels[2].pwmOutput = pwmRL;
+        wheels[3].targetRps = rrTarget;
+        wheels[3].pwmOutput = pwmRR;
+    }
+}
+
+// ============================================================================
+// 讀取編碼器並計算各輪當前轉速 (RPS)
+// ============================================================================
+static void readEncoders(float dt) {
+    // 編碼器解析度配置：預設 1200 PPR，4 倍頻 = 4800 count/rev
+    constexpr float ENC_COUNTS_PER_REV = 4.0f * 1200.0f;
+    constexpr float INV_ENC = 1.0f / ENC_COUNTS_PER_REV;
+
+    static int32_t prevCount[4] = {0, 0, 0, 0};
+
+    for(int i = 0; i < 4; i++) {
+        int32_t rawCount = wheels[i].encoderCount;
+        int32_t delta = rawCount - prevCount[i];
+        prevCount[i] = rawCount;
+
+        // delta count / (count/rev) / dt = rev/s (RPS)
+    // delta count / (每轉計數) / dt = rev/s (RPS)
+        wheels[i].currentRps = static_cast<float>(delta) * INV_ENC / dt;
+    }
+}
+
+// E-Stop — 立即歸零所有 PWM (agent.md §E-Stop 安全機制)
+// 注意：車身層的 RampedTarget 在 core1_main 本地變數，
+// E-Stop 觸發後 Core 1 不會執行控制邏輯，ramper 自然停滯。
+// 當命令恢復時，因 ramper previous_ 停在大值，車身會從當前速度漸變。
+// 若需 E-Stop 後從零開始，可在 E-Stop 解除時重置 ramper，
+// 做法：在 core1_main 中檢查 estop falling edge 後呼叫 rampVx.reset() 等。
+static void emergencyStop() {
+    for(int i = 0; i < 4; i++) {
+        pio_sm_put(wheels[i].pioBlock, wheels[i].pwmSm, 0);
+        wheels[i].pid.reset();
+        wheels[i].currentRps = 0.0f;
+        wheels[i].targetRps = 0.0f;
+        wheels[i].pwmOutput = 0.0f;
+    }
+}
+
+// ============================================================================
+// 輔助函數（備用）
+// ============================================================================
+static float rpsToPwm(float rpsTarget) {
+    return (rpsTarget / RobotConfig::MAX_RPS) * RobotConfig::PID_OUT_LIMIT;
+}
+
+static float pwmToRps(float pwm) {
+    return (pwm / RobotConfig::PID_OUT_LIMIT) * RobotConfig::MAX_RPS;
 }

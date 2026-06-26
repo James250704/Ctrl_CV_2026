@@ -1,64 +1,81 @@
 #pragma once
 #include "signal_shared.h"
 #include <Arduino.h>
-#include <hardware/dma.h>
-#include <hardware/uart.h>
 
 // ============================================================================
-// ChassisComms — Hub ↔ Jetson UART communication (Hub-side only)
+// ChassisComms — 通用 COBS 協議庫
 //
-// Per agent.md topology:
-//   Hub ↔ Jetson: hardware UART0, GP0 TX, GP1 RX, 921600 baud
+// 根據 agent.md 規範，綁定到任意 Stream 介面，提供完整的 COBS 封幀
+// 收發、CRC-CCITT 驗證、幀序號去重、與 30ms 心跳。
 //
-// Handles:
-//   - DMA ping-pong receive (lock-free, zero-copy scan)
-//   - COBS frame decode + CRC-CCITT verify
-//   - Frame sequence anti-duplicate (agent.md §帧序号抗干扰)
-//   - Registered callback for decoded ControlPacket dispatch
-//   - 30ms heartbeat generation (agent.md §心跳)
-//   - Non-blocking TX with drop-on-full (agent.md §发送规则)
+// 支援的 Stream 類型（任意實作 Stream 介面的物件）：
+//   - Serial       (USB CDC — Hub 與 Jetson 通訊)
+//   - SerialPIO    (PIO UART — Hub 與 Slaves 通訊, Slave 與 Hub 通訊)
+//   - HardwareSerial (UART 週邊)
 //
-// NOT for slave nodes — Slaves connect via PIO UART.
+// 使用方式（Hub 端）：
+//   static ChassisComms jetsonComms(&Serial, TargetID::HUB);
+//   jetsonComms.begin();
+//   jetsonComms.setFrameCallback(onJetsonFrame);
+//   // 在 loop() 中呼叫：
+//   jetsonComms.update();
+//
+// 使用方式（Slave 端）：
+//   static SerialPIO uart(0, 0, PIN_TX);
+//   static ChassisComms hubComms(&uart, TargetID::HUB);
+//   hubComms.begin();
+//   hubComms.setFrameCallback(onHubFrame);
+//   // 在 loop() 中呼叫：
+//   hubComms.update();
 // ============================================================================
 class ChassisComms {
 public:
-    static ChassisComms& getInstance();
+    /// @param stream      綁定的 Stream（Serial / SerialPIO / HardwareSerial）
+    /// @param hbTarget    心跳的 targetID（預設 TargetID::HUB）
+    /// @param hbIntervalUs 心跳間隔微秒（預設 30000us = 30ms，設 0 停用心跳）
+    ChassisComms(Stream* stream,
+                 uint8_t hbTarget    = TargetID::HUB,
+                 uint64_t hbIntervalUs = RobotConfig::HEARTBEAT_INTERVAL_US);
 
-    void init();
+    /// 開始運作（重設內部 COBS 掃描狀態、幀序號、心跳計時器）
+    void begin();
+
+    /// 每次主迴圈呼叫：
+    ///   1. 從綁定的 Stream 讀取所有可用位元組
+    ///   2. 掃描 COBS 分隔符 (0x00)
+    ///   3. 遇到分隔符 → COBS 解碼 → CRC 驗證 → 回呼分發
+    ///   4. 若達心跳間隔 → 產生心跳 ControlPacket
     void update();
 
-    /// Callback invoked for every valid decoded ControlPacket from Jetson.
+    /// 收到有效解碼幀時觸發的回呼
     using FrameCallback = void (*)(const ControlPacket& pkt);
     void setFrameCallback(FrameCallback cb) { frameCb = cb; }
 
-    /// Send a ControlPacket to Jetson. Non-blocking — drops if TX FIFO full.
-    /// Returns true if queued, false if dropped.
+    /// 發送 ControlPacket（COBS 編碼 + CRC 戳記 + 寫入 Stream）
+    /// 非阻塞：若 Stream 有剩餘 TX 空間則寫入，否則靜默丟棄
+    /// @return true = 已寫入, false = 已丟棄
     bool sendPacket(const ControlPacket& pkt);
 
 private:
-    ChassisComms() = default;
     ChassisComms(const ChassisComms&) = delete;
     ChassisComms& operator=(const ChassisComms&) = delete;
 
-    void initUartDmaPingPong();
     void processFrame(const uint8_t* data, size_t len);
 
-    // DMA ping-pong — static to stay in .bss
-    static uint8_t dmaBuffer[2][512];
-    static int     dmaChanA;
-    static int     dmaChanB;
+    Stream*  stream;
+    uint8_t  hbTargetID;
+    uint64_t hbIntervalUs;
 
-    // COBS scan state
-    size_t  scanPos    = 0;
+    // COBS 掃描狀態
     uint8_t parseWorkBuf[512];
     size_t  workBufIdx = 0;
 
-    // Frame receive tracking
-    FrameCallback frameCb     = nullptr;
+    // 幀追蹤
+    FrameCallback frameCb      = nullptr;
     uint8_t       lastFrameSeq = 0;
     bool          firstFrame   = true;
 
-    // Heartbeat state
+    // 心跳
     uint64_t lastHeartbeatTime = 0;
-    uint8_t  txFrameSeq       = 0;
+    uint8_t  txFrameSeq        = 0;
 };

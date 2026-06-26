@@ -8,49 +8,64 @@ description: 棒球機器人 RP2350 — 拓撲明確的 Hub/Slave 雙核 COBS/PI
 ## 系統拓撲
 
 ```
-┌──────────┐   UART(COBS)   ┌─────────────────────────────────────┐
-│  Jetson  │◄──────────────►│  Hub (RP2350)    中央轉發控制        │
-│ (主電腦)  │               │  - Core 0: 與 Jetson & Slaves 通訊   │
-└──────────┘               │  - Core 1: (保留，暫未使用)          │
-                            └──┬───────┬───────┬───────┘
-                  PIO UART(COBS)│       │       │
-                            ┌──┘       │       └──┐
-                            ▼          ▼          ▼
-                     ┌──────────┐ ┌──────────┐ ┌──────────┐
-                     │  Move    │ │  Shoot   │ │ Storage  │
-                     │ (RP2350) │ │ (RP2350) │ │ (RP2350) │
-                     │ Core 0:  │ │ Core 0:  │ │ Core 0:  │
-                     │ 通訊     │ │ 通訊     │ │ 通訊     │
-                     │ Core 1:  │ │ Core 1:  │ │ Core 1:  │
-                     │ 馬達控制 │ │ 馬達控制 │ │ 馬達控制 │
-                     └──────────┘ └──────────┘ └──────────┘
+┌──────────┐   USB(COBS)    ┌──────────────────────────────────────┐
+│  Jetson  │◄──────────────►│  Hub (RP2350)    中央轉發控制          │
+│ (主電腦)  │ CDC ACM        │  - setup():    USB CDC 初始化         │
+└──────────┘                │  - setup1():   各 Slave PIO UART 初始化 │
+                             │  - loop():     與 Jetson USB 收發      │
+                             │  - loop1():    與 Slaves PIO UART 收發 │
+                             └──┬───────┬───────┬───────┘
+                   PIO UART(COBS)│       │       │
+                             ┌──┘       │       └──┐
+                             ▼          ▼          ▼
+                      ┌──────────┐ ┌──────────┐ ┌──────────┐
+                      │  Move    │ │  Shoot   │ │ Storage  │
+                      │ (RP2350) │ │ (RP2350) │ │ (RP2350) │
+                      │ setup(): │ │ setup(): │ │ setup(): │
+                      │ PIO UART │ │ PIO UART │ │ PIO UART │
+                      │ setup1():│ │ setup1():│ │ setup1():│
+                      │ 馬達初始化│ │ 馬達初始化│ │ 馬達初始化│
+                      │ loop():  │ │ loop():  │ │ loop():  │
+                      │ 通訊     │ │ 通訊     │ │ 通訊     │
+                      │ loop1(): │ │ loop1(): │ │ loop1(): │
+                      │ 馬達控制 │ │ 馬達控制 │ │ 馬達控制 │
+                      └──────────┘ └──────────┘ └──────────┘
 ```
 
-- **Jetson** → **Hub**：UART 硬體（UART0），COBS 封幀
-- **Hub** → **Slaves**：PIO UART（每個 Slave 一條獨立的 PIO UART link）
+- **Jetson → Hub** : USB CDC ACM，COBS 封幀 + Binary struct + CRC16
+- **Hub → Slaves** : PIO UART，COBS 封幀 + Binary struct + CRC16（每個 Slave 一條獨立的 PIO UART link）
 - **Slave（move / shoot / storage）**：使用 **PIO UART** 收發 TX/RX 訊號，不用硬體 UART 外設
   - 好處：腳位任意指定、精確 bit timing、抗干擾能力優於中斷驅動的 UART
   - Hub 端也使用 PIO UART 與對應的 Slave 通訊，每個 Slave 使用一組獨立的 PIO 狀態機
+- **開發框架**：PlatformIO + Earlephilhower Arduino-Pico（RP2350 支援）
+- **雙核心啟動**：統一使用 `setup()` + `setup1()` 初始化，`loop()` + `loop1()` 主迴圈
 
 ## 核心分配
 
 ### Hub (RP2350)
 
-| Core | 職責 |
-|------|------|
-| Core 0 (loop) | 與 Jetson 收發 COBS 幀 → 解析 → 轉發至對應 Slave |
-| Core 1 (loop1) | 保留（暫不使用） |
+| Core | 函式 | 職責 |
+|------|------|------|
+| Core 0 | `setup()` / `loop()` | USB CDC 初始化、與 Jetson 收發 COBS 幀 → 解析 → 轉發至對應 Slave |
+| Core 1 | `setup1()` / `loop1()` | 各 Slave PIO UART 初始化、與 Slaves PIO UART 收發 COBS 幀 |
 
 ### Slaves — Move / Shoot / Storage (RP2350)
 
-| Core | 職責 |
-|------|------|
-| Core 0 (loop) | PIO UART 收發 COBS 幀、CRC 驗證、指令解析、通知 Core 1 |
-| Core 1 (loop1) | **由 Core 0 觸發**：收到有效控制幀 → 立即執行馬達控制 |
+| Core | 函式 | 職責 |
+|------|------|------|
+| Core 0 | `setup()` / `loop()` | PIO UART 收發 COBS 幀、CRC 驗證、指令解析、通知 Core 1 |
+| Core 1 | `setup1()` / `loop1()` | 馬達初始化、**由 Core 0 觸發**：收到有效控制幀 → 立即執行馬達控制 |
+
+### 框架注意事項
+
+- Earlephilhower Arduino-Pico 的雙核心啟動順序：`setup()` → `setup1()`（Core 0 → Core 1）
+- `loop()` 和 `loop1()` 分別在 Core 0 和 Core 1 獨立運作
+- 全域變數在雙核心間共享，需注意 atomic / memory_order 同步（參見核心間通訊章節）
+- 禁止在 `setup1()` / `loop1()` 中使用 `Serial` 相關呼叫（USB CDC 綁定 Core 0）
 
 ## Slave 核心間同步機制（全車同步關鍵）
 
-**原則：Slave Core 1 不設獨立定時器迴圈，由 Core 0 收到有效控制幀後觸發執行。**
+**原則：Slave Core 1 (`loop1()`) 不設獨立定時器迴圈，由 Core 0 (`loop()`) 收到有效控制幀後觸發執行。**
 
 ```
 Core 0 (loop):
@@ -85,7 +100,8 @@ Core 1 (loop1):
 
 - PIO UART RX 使用 IRQ + ring buffer（不輪詢、不 block）
 - COBS 完整解一幀後才進行 CRC 驗證、派送指令
-- 通訊專用 PIO UART — `Serial.print()` / `printf()` 走除錯 UART（USB CDC 或 Serial2）
+- Hub Core 0 使用 USB CDC ACM 收發（非 UART），同樣走 COBS + CRC
+- 通訊專用 PIO UART — `Serial.print()` / `printf()` 走 USB CDC
 - 所有工作緩衝區靜態分配於 .bss，禁止 new/malloc
 - Hub 端的 PIO UART 腳位：每個 Slave 一組獨立的 PIO 狀態機 TX/RX
 
@@ -150,15 +166,14 @@ static std::atomic<uint8_t> cmdWriteIdx{0};
 - 收到重複序號視為重送或錯誤，忽略
 - 序號跳號（gap）視為掉幀，可觸發安全機制
 
-### UART 腳位
+### 通訊介面一覽
 
-| 節點 | TX | RX | 鮑率 | 類型 |
-|------|----|----|------|------|
-| Hub ↔ Jetson | GP0 | GP1 | 921600 | 硬體 UART0 |
-| Hub ↔ Move | PIO SM0 | PIO SM0 | 921600 | PIO UART |
-| Hub ↔ Shoot | PIO SM1 | PIO SM1 | 921600 | PIO UART |
-| Hub ↔ Storage | PIO SM2 | PIO SM2 | 921600 | PIO UART |
-| 除錯 | GP4 (TX) | GP5 (RX) | 115200 | 硬體 UART1 |
+| 鏈路 | 節點 | 介面類型 | 鮑率/速率 | COBS+CRC |
+|------|------|----------|-----------|----------|
+| Jetson ↔ Hub | GP0/GP1 | USB CDC ACM (Serial) | 921600 bps | ✅ |
+| Hub ↔ Move | PIO SM0 | PIO UART | 921600 bps | ✅ |
+| Hub ↔ Shoot | PIO SM1 | PIO UART | 921600 bps | ✅ |
+| Hub ↔ Storage | PIO SM2 | PIO UART | 921600 bps | ✅ |
 
 ### 指令超時保護
 
@@ -207,4 +222,4 @@ static std::atomic<uint8_t> cmdWriteIdx{0};
   - 中距離加 74LVC1G07 緩衝器
   - 長距離或靠近馬達：**RS-485 收發器** 或 **光耦合隔離**
 - 軟體端：frameSeq 抵抗重送/掉幀，CRC 抵抗 bit error，E-Stop 抵抗失聯
-- 掉幀率偏高時降低鮑率（921600→115200）作為抗干擾手段
+- 掉幀率偏高時降低鮑率作為抗干擾手段

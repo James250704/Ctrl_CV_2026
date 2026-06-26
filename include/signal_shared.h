@@ -4,40 +4,40 @@
 #include <Arduino.h>
 
 // ============================================================================
-// RobotConfig — System-level constants (baud rates, timing, motor limits)
-// Per agent.md topology:
-//   Hub ↔ Jetson:  hardware UART0 (GP0/GP1)
-//   Hub ↔ Slaves:  PIO UART (GP16/GP17 etc.)
-//   Debug:         hardware UART1 (GP4/GP5)
+// RobotConfig — 系統層級常數（鮑率、時序、馬達限制）
+// 根據 agent.md 拓撲：
+//   Hub ↔ Jetson：  硬體 UART0 (GP0/GP1)
+//   Hub ↔ Slaves：  PIO UART (GP16/GP17 等)
+//   除錯調試：      硬體 UART1 (GP4/GP5)
 // ============================================================================
 namespace RobotConfig {
 
-// Baud rates matching agent.md UART table
-constexpr uint32_t JETSON_BAUDRATE  = 921600U;  // Hub ↔ Jetson: hardware UART0
-constexpr uint32_t PIO_BAUDRATE     = 921600U;  // Hub ↔ Slaves: PIO UART
-constexpr uint32_t DEBUG_BAUDRATE   = 115200U;   // Debug UART1 (GP4 TX, GP5 RX)
+// 鮑率，對應 agent.md UART 表格
+constexpr uint32_t JETSON_BAUDRATE  = 921600U;  // Hub ↔ Jetson：硬體 UART0
+constexpr uint32_t PIO_BAUDRATE     = 921600U;  // Hub ↔ Slaves：PIO UART
+constexpr uint32_t DEBUG_BAUDRATE   = 115200U;   // 除錯調試 UART1 (GP4 TX, GP5 RX)
 
-// Timing — agent.md §超时保护 & §心跳
+// 時序 — agent.md §超時保護 & §心跳
 constexpr uint32_t  CONTROL_DT_MS          = 1U;
-constexpr uint64_t  COMMAND_TIMEOUT_US     = 100000ULL;     // 100ms → E-Stop
-constexpr uint64_t  HEARTBEAT_TIMEOUT_US   = 500000ULL;     // 500ms
-constexpr uint64_t  HEARTBEAT_INTERVAL_US  = 30000ULL;      // 30ms TX interval
+constexpr uint64_t  COMMAND_TIMEOUT_US     = 100000ULL;     // 100ms → 緊急停止
+constexpr uint64_t  HEARTBEAT_TIMEOUT_US   = 500000ULL;     // 500ms 逾時
+constexpr uint64_t  HEARTBEAT_INTERVAL_US  = 30000ULL;      // 30ms 發送間隔
 
-// Motor / PID limits
+// 馬達 / PID 極限值
 constexpr float     MAX_RPS         = 7.0f;
 constexpr float     KF_GAIN         = 21.5f;
 constexpr float     PID_OUT_LIMIT   = 30.0f;
 constexpr float     SLEW_RATE_LIMIT = 50.0f;
 constexpr uint16_t  MOTOR_MAX_DUTY  = 40000U;
 
-// COBS protocol limits
+// COBS 協定限制
 constexpr size_t    COBS_MAX_PAYLOAD     = 254U;
 constexpr size_t    COBS_ENCODED_MAX     = 256U;
 
 } // namespace RobotConfig
 
 // ============================================================================
-// Protocol constants — per agent.md §Binary Struct
+// 協定常數 — 根據 agent.md §二進位結構體
 // ============================================================================
 
 namespace MsgType {
@@ -62,32 +62,32 @@ constexpr uint8_t FAILSAFE = 2;
 } // namespace RobotMode
 
 // ============================================================================
-// ControlPacket — wire-format packet per agent.md protocol spec
+// ControlPacket — 線路格式封包，根據 agent.md 協定規範
 //
-// Header: sync(0xA5), msgType, frameSeq, targetID, payloadLen, crc16
-// CRC16 covers all fields EXCEPT the crc16 field itself.
-// Little-endian byte order (RP2350 native).
+// 標頭：sync(0xA5)、msgType、frameSeq、targetID、payloadLen、crc16
+// CRC16 涵蓋除 crc16 欄位本身之外的所有欄位。
+// 使用小端序位元組順序（RP2350 原生）。
 // ============================================================================
 struct ControlPacket {
-    uint8_t  sync;         // 0xA5 frame sync byte
-    uint8_t  msgType;      // MsgType constant
-    uint8_t  frameSeq;     // Incrementing sequence (wraps at 0) — anti-duplicate
-    uint8_t  targetID;     // TargetID constant (0=Hub, 1=Move, 2=Shoot, 3=Storage, 0xFF=Broadcast)
-    uint16_t payloadLen;   // Payload byte count (fixed = 12 for this struct layout)
-    int8_t   vx;           // Linear velocity X
-    int8_t   vy;           // Linear velocity Y
-    int8_t   omega;        // Angular velocity
+    uint8_t  sync;         // 0xA5 幀同步位元組
+    uint8_t  msgType;      // MsgType 常數
+    uint8_t  frameSeq;     // 遞增序號（繞回至 0）— 抗重複
+    uint8_t  targetID;     // TargetID 常數（0=Hub、1=Move、2=Shoot、3=Storage、0xFF=廣播）
+    uint16_t payloadLen;   // 酬載位元組數（此結構佈局固定為 12）
+    int8_t   vx;           // 線速度 X
+    int8_t   vy;           // 線速度 Y
+    int8_t   omega;        // 角速度
     uint8_t  mode;         // RobotMode
-    uint32_t timestamp_hi; // Microsecond timestamp (high 32 bits)
-    uint32_t timestamp_lo; // Microsecond timestamp (low 32 bits)
-    uint16_t crc16;        // CRC-CCITT over all preceding bytes
+    uint32_t timestamp_hi; // 微秒時間戳（高 32 位元）
+    uint32_t timestamp_lo; // 微秒時間戳（低 32 位元）
+    uint16_t crc16;        // 所有前置位元組的 CRC-CCITT 校驗
 } __attribute__((packed));
 
-static_assert(sizeof(ControlPacket) == 20, "ControlPacket padding violation!");
+static_assert(sizeof(ControlPacket) == 20, "ControlPacket 存在填充位元組！");
 
 // ============================================================================
-// ChassisSnapshot — in-memory decoded command (not wire format)
-// Used internally for core-to-core command passing per agent.md §核心間通訊
+// ChassisSnapshot — 記憶體內解碼後的命令（非線路格式）
+// 內部用於核心間命令傳遞，根據 agent.md §核心間通訊
 // ============================================================================
 struct ChassisSnapshot {
     float    vx;
@@ -99,16 +99,16 @@ struct ChassisSnapshot {
 };
 
 // ============================================================================
-// SignalUtils — CRC-CCITT (poly 0x1021) and COBS encode/decode
+// SignalUtils — CRC-CCITT（多項式 0x1021）及 COBS 編解碼
 //
-// CRC table is a compile-time const in Flash — only one copy ever exists
-// across all TUs. No initCrcTable() call needed, zero .bss waste.
+// CRC 表為編譯期常數，儲存在 Flash 中 — 所有編譯單元共用同一份。
+// 無需呼叫 initCrcTable()，不浪費 .bss 空間。
 // ============================================================================
 namespace SignalUtils {
 
-// CRC-CCITT lookup table (polynomial 0x1021), ROMable in Flash.
-// constexpr guarantees compile-time evaluation — zero runtime init,
-// enables aggressive inlining and prefetch by the compiler.
+// CRC-CCITT 查找表（多項式 0x1021），可常駐 Flash。
+// constexpr 保證編譯期計算 — 零執行時期初始化，
+// 使編譯器能積極內聯與預取。
 static constexpr uint16_t crcTable[256] = {
     0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
     0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
@@ -144,8 +144,8 @@ static constexpr uint16_t crcTable[256] = {
     0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0,
 };
 
-// Calculate CRC-CCITT (0xFFFF init) over data.
-// Note: pass len = sizeof(ControlPacket) - 2 to exclude the crc16 field.
+// 計算 CRC-CCITT（初始值 0xFFFF）。
+// 注意：傳入 len = sizeof(ControlPacket) - 2 以排除 crc16 欄位。
 inline uint16_t calculateCrc(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFFU;
     for (size_t i = 0; i < len; i++) {
@@ -156,8 +156,8 @@ inline uint16_t calculateCrc(const uint8_t* data, size_t len) {
     return crc;
 }
 
-// COBS encode: returns encoded byte count.
-// dst must be at least len + len / 254 + 2 bytes.
+// COBS 編碼：回傳編碼後的位元組數。
+// dst 至少需 len + len / 254 + 2 個位元組。
 inline size_t cobsEncode(const uint8_t* src, size_t len, uint8_t* dst) {
     size_t codeIdx  = 0;
     size_t readIdx  = 0;
@@ -184,16 +184,14 @@ inline size_t cobsEncode(const uint8_t* src, size_t len, uint8_t* dst) {
     return writeIdx;
 }
 
-// COBS decode: returns decoded byte count (0 on error).
+// COBS 解碼：回傳解碼後的位元組數（錯誤時回傳 0）。
 //
-// ** Defence-in-depth **
-//   1. Before entering the inner copy loop, verify that we have enough
-//      source bytes remaining: readIdx + (code-1) <= len
-//   2. Track writeIdx against a 512-byte ceiling (all callers use 512-byte
-//      dst buffers). This catches corrupted `code` values from EMI bit-flips
-//      that would otherwise overflow dst and trigger a HardFault.
+// ** 深度防禦 **
+//   1. 進入內部複製迴圈前，驗證剩餘來源位元組是否足夠：readIdx + (code-1) <= len
+//   2. 追蹤 writeIdx 不超過 512 位元組上限（所有呼叫者均使用 512 位元組 dst 緩衝區）。
+//      這能捕捉 EMI 位元翻轉造成的損毀 code 值，避免溢寫 dst 而觸發 HardFault。
 //
-// Both guards return 0 (decode failure) — the caller drops the frame.
+// 兩種防護都在失敗時回傳 0（解碼失敗）— 由呼叫者丟棄該幀。
 static constexpr size_t COBS_DST_MAX = 512;
 
 inline size_t cobsDecode(const uint8_t* src, size_t len, uint8_t* dst) {
@@ -204,15 +202,15 @@ inline size_t cobsDecode(const uint8_t* src, size_t len, uint8_t* dst) {
         uint8_t code = src[readIdx];
         size_t  blockLen = static_cast<size_t>(code);
 
-        // Guard 1: not enough source bytes for the advertised block
+        // 防護 1：來源位元組數不足，無法滿足宣告的區塊長度
         if (readIdx + blockLen > len) {
             return 0;
         }
         readIdx++;
 
-        // Guard 2: destination would overflow (EMI-corrupted code)
-        // blockLen == 1  → no data bytes to copy (just a zero-run marker)
-        // blockLen >= 2  → we will write (blockLen-1) data bytes
+        // 防護 2：目的地將溢位（EMI 損毀的 code 值）
+        // blockLen == 1  → 無資料位元組需複製（僅為零值標記）
+        // blockLen >= 2  → 將寫入 (blockLen-1) 個資料位元組
         if (writeIdx + (blockLen - 1) > COBS_DST_MAX) {
             return 0;
         }
@@ -220,7 +218,7 @@ inline size_t cobsDecode(const uint8_t* src, size_t len, uint8_t* dst) {
         for (uint8_t i = 1; i < code; i++)
             dst[writeIdx++] = src[readIdx++];
 
-        // Insert the implicit zero (unless this was the final block marker)
+        // 插入隱含的零值（除非這是最後一個區塊標記）
         if (code < 0xFF && readIdx < len) {
             if (writeIdx >= COBS_DST_MAX)
                 return 0;
