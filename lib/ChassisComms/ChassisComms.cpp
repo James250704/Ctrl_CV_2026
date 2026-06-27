@@ -24,6 +24,13 @@ void ChassisComms::processFrame(const uint8_t* data, size_t len) {
     const ControlPacket& pkt = *reinterpret_cast<const ControlPacket*>(data);
     if (pkt.sync != 0xA5) return;
 
+    // E-Stop 為中斷事件：跳過幀序號去重，每次都必須傳遞（agent.md §E-Stop）
+    if (pkt.msgType == MsgType::ESTOP) {
+        if (frameCb != nullptr)
+            frameCb(pkt);
+        return;
+    }
+
     // 幀序號抗重複 (agent.md §幀序號抗干擾)
     if (!firstFrame && pkt.frameSeq == lastFrameSeq)
         return;

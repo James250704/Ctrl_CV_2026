@@ -76,7 +76,7 @@ flowchart LR
 
     subgraph Move["Move（RP2350）"]
         direction TB
-        M_C0["Core 0 loop()<br/>PIO UART · COBS · CRC"]
+        M_C0["Core 0 loop()<br/>UART0 · COBS · CRC"]
         M_C1["Core 1 loop1()<br/>麥克納姆輪 PID 控制"]
     end
 
@@ -106,7 +106,8 @@ flowchart LR
 - **Jetson → Hub**：USB CDC ACM，COBS 封幀 + Binary struct + CRC16
 - **Hub → Slaves**：PIO UART，COBS 封幀 + Binary struct + CRC16（每條獨立 PIO link）
 - **Ultrasonic**：獨立 Pico 節點，透過 USB Serial（CDC ACM）直接連接 Jetson，純文字協定無 COBS 封幀。使用 PIO 以 GPIO Trigger/Echo 模式輪詢 6 顆 US-100 超音波感測器，每秒約 15Hz 輸出濾波後距離與對位差值。
-- **Slave（move / shoot / storage）**：PIO UART 收發（非硬體 UART），腳位自由指定、精確 bit timing
+- **Slave（move）**：硬體 UART0 收發（與 Hub PIO UART 相容，baud rate 一致即可互通）
+- **Slave（shoot / storage）**：PIO UART 收發（非硬體 UART），腳位自由指定、精確 bit timing
 - **框架**：PlatformIO + [Earlephilhower Arduino-Pico](https://github.com/earlephilhower/arduino-pico) (RP2350)
 - **雙核心啟動**：統一 `setup()` (Core 0) → `setup1()` (Core 1)，主迴圈 `loop()` / `loop1()`
 
@@ -125,10 +126,10 @@ flowchart LR
 
 | Core | 函式 | 職責 |
 |------|------|------|
-| Core 0 | `setup()` / `loop()` | PIO UART 收發、COBS 解包、CRC 驗證、指令解析、通知 Core 1 |
+| Core 0 | `setup()` / `loop()` | 硬體 UART0 / PIO UART 收發、COBS 解包、CRC 驗證、指令解析、通知 Core 1 |
 | Core 1 | `setup1()` / `loop1()` | 馬達初始化、**由 Core 0 觸發**執行馬達控制 |
 
-### ⚠️ 框架注意事項
+### ⚠️ 注意：Move Slave 使用硬體 UART0，Shoot / Storage Slave 使用 PIO UART
 
 - Earlephilhower Arduino-Pico 啟動順序：`setup()` (Core 0) → `setup1()` (Core 1)
 - `loop()` 和 `loop1()` 分別在兩顆核心獨立運作
@@ -215,7 +216,7 @@ USB CDC 或 PIO UART (921600 bps)
 |------|------|------|
 | Jetson ↔ Hub | USB CDC ACM (Serial) | 921600 bps |
 | Jetson ↔ Ultrasonic | USB CDC ACM | 115200 bps | ❌ 裸文字串 |
-| Hub ↔ Move | PIO UART SM0 | 921600 bps |
+| Hub ↔ Move | PIO UART SM0 ↔ Move UART0 | 921600 bps |
 | Hub ↔ Shoot | PIO UART SM1 | 921600 bps |
 | Hub ↔ Storage | PIO UART SM2 | 921600 bps |
 

@@ -2,8 +2,12 @@
 // Move Slave — 四輪麥克納姆輪控制韌體 (RP2350)
 //
 // 根據 agent.md 雙核架構規範：
-//   Core 0 (loop):  PIO UART 收發 COBS 幀、CRC 驗證、指令解析、通知 Core 1
+//   Core 0 (loop):  硬體 UART0 收發 COBS 幀、CRC 驗證、指令解析、通知 Core 1
 //   Core 1 (loop1): 由 Core 0 觸發，執行 Mecanum 運動學解算 + 四輪獨立 PID 控制
+//
+// 通訊（agent.md §通訊協議）：
+//   Hub PIO UART SM0 (GP6 TX, GP7 RX) ↔ Move UART0 (setPinout GP6 RX, GP7 TX)
+//   921600 baud, COBS 封幀 + CRC16
 //
 // 硬體配置（每輪）：
 //   - 一組 PIO PWM (2 個 state machine 可做互補輸出，或 1 個 SM 做單端)
@@ -23,15 +27,21 @@
 #include <pico/multicore.h>
 #include <pico/stdlib.h>
 
+#include "ChassisComms.h"
 #include "signal_shared.h"
 
 // ============================================================================
 // 腳位定義 (依實際硬體接線修改)
 // ============================================================================
 namespace Pin {
-// PIO UART — 與 Hub 通訊 (agent.md §UART 腳位)
-constexpr uint PIO_UART_TX = 4; // PIO UART TX to Hub
-constexpr uint PIO_UART_RX = 5; // PIO UART RX from Hub
+// 硬體 UART0 — 與 Hub 通訊（agent.md §通訊協議）
+// UART0 預設腳位 TX=GP0, RX=GP1（Earlephilhower Serial1）
+// 接線（外接）：
+//   Hub PIO SM0 TX(GP6) ──── Move UART0 RX(GP1)
+//   Hub PIO SM0 RX(GP7) ──── Move UART0 TX(GP0)
+// 不需 setPinout，直接用 Serial1 預設腳位
+constexpr uint UART_TX = 0; // UART0 TX (default) — GP0
+constexpr uint UART_RX = 1; // UART0 RX (default) — GP1
 
 // 四輪馬達 PWM (使用 PIO PWM)
 constexpr uint MOTOR1_PWM = 6; // FL — 前左
@@ -48,10 +58,6 @@ constexpr uint MOTOR3_ENC_A = 14; // RL Encoder A
 constexpr uint MOTOR3_ENC_B = 15; // RL Encoder B
 constexpr uint MOTOR4_ENC_A = 16; // RR Encoder A
 constexpr uint MOTOR4_ENC_B = 17; // RR Encoder B
-
-// 除錯 UART (agent.md: UART1, GP4 TX, GP5 RX)
-constexpr uint DEBUG_TX = 4;
-constexpr uint DEBUG_RX = 5;
 } // namespace Pin
 
 // ============================================================================
@@ -250,10 +256,18 @@ static std::atomic<bool> estopActive{false};
 static uint64_t lastValidFrameTime = 0;
 
 // 除錯輸出 (透過 UART1)
-static Stream* debugOut = nullptr;
+// static Stream* debugOut = nullptr;  // 取代為 debugOut 直接指向 Serial1
 
 // 時間追蹤
 static absolute_time_t lastControlTime;
+
+// ============================================================================
+// 硬體 UART0 + ChassisComms — 與 Hub 通訊
+// ============================================================================
+// Serial1 = 硬體 UART0 on RP2350（Earlephilhower mapping）
+// 透過 setPinout() 將 RX 映射到 GP6（接收 Hub PIO TX）、TX 映射到 GP7
+// ChassisComms 綁定此 UART，心跳 30ms 回送 Hub
+static ChassisComms hubComms(&Serial1, TargetID::HUB, RobotConfig::HEARTBEAT_INTERVAL_US);
 
 // ============================================================================
 // PIO 程式 — 四倍頻編碼器解碼
@@ -321,11 +335,13 @@ static float pwmToRps(float pwm);
 // Core 0 — 通訊核心
 // ============================================================================
 void setup() {
-    // 初始化除錯輸出
-    Serial1.setPinout(Pin::DEBUG_TX, Pin::DEBUG_RX);
-    Serial1.begin(RobotConfig::DEBUG_BAUDRATE);
-    debugOut = &Serial1;
-    debugOut->println("[Move] Slave booting...");
+    // ---- 硬體 UART0 初始化（921600 baud，與 Hub PIO UART 相容）----
+    // Serial1 = UART0 on RP2350，預設腳位 TX=GP0, RX=GP1
+    Serial1.begin(RobotConfig::PIO_BAUDRATE);
+
+    // ChassisComms 綁定到 Serial1，30ms 心跳回送 Hub
+    hubComms.begin();
+    hubComms.setFrameCallback(onHubFrame);
 
     // ---- PIO PWM 初始化 (block1, 4 SM 給 4 輪) ----
     PIO pwmPio = pio1;
@@ -362,9 +378,9 @@ void setup() {
         wheels[i].pwmOutput = 0.0f;
         wheels[i].encoderCount = 0;
 
-        debugOut->print("[Move] Motor ");
-        debugOut->print(i);
-        debugOut->println(" PWM initialized on PIO.");
+        Serial.print("[Move] Motor ");
+        Serial.print(i);
+        Serial.println(" PWM initialized on PIO.");
     }
 
     // ---- PIO Encoder 初始化 (block0, 4 SM 給 4 輪) ----
@@ -414,64 +430,67 @@ void setup() {
         pio_sm_init(encPio, i, encOffset, &encCfg);
         pio_sm_set_enabled(encPio, i, true);
 
-        debugOut->print("[Move] Encoder ");
-        debugOut->print(i);
-        debugOut->println(" initialized.");
+        Serial.print("[Move] Encoder ");
+        Serial.print(i);
+        Serial.println(" initialized.");
     }
 
     // ---- 啟動 Core 1 ----
     lastControlTime = get_absolute_time();
     multicore_launch_core1(core1_main);
-    debugOut->println("[Move] Core 1 launched.");
+    Serial.println("[Move] Core 1 launched.");
 }
 
 // ============================================================================
 // Core 0 主迴圈：持續收 COBS 幀
 // ============================================================================
 void loop() {
-    // PIO UART 接收透過 ChassisComms 處理，此處簡化為逾時監控
-    // 實際使用時：
-    //
-    //   static SerialPIO hubPio(Pin::PIO_UART_TX, Pin::PIO_UART_RX, 921600);
-    //   static ChassisComms hubComms(&hubPio, TargetID::MOVE);
-    //   hubComms.setFrameCallback(onHubFrame);
-    //   hubComms.begin();
-    //
-    //   hubComms.update();  // 在 loop() 中呼叫
-    //
-    // ChassisComms::update() 處理：
-    //   1. 從 PIO UART 讀取位元組
-    //   2. COBS 解碼 + CRC 驗證
-    //   3. 幀序號去重
-    //   4. 呼叫 onHubFrame 回呼
-    //   5. 30ms 心跳
-    //
-    // 此處以 sleep_ms(1) 模擬輪詢週期
+    // 1. ChassisComms::update() 處理：
+    //    - 從硬體 UART0 (Serial1) 讀取位元組
+    //    - COBS 解碼 + CRC 驗證
+    //    - 幀序號去重
+    //    - 呼叫 onHubFrame 回呼 (CONTROL 型別)
+    //    - 30ms 心跳向 Hub 發送
+    hubComms.update();
 
-    tight_loop_contents();
-
-    // 逾時 E-Stop 檢查 (agent.md §指令超時保護)
-    uint64_t now = time_us_64();
+    // 2. 逾時 E-Stop 檢查 (agent.md §指令超時保護)
+    //    最後有效控制幀超過 100ms 無更新 → 強制 E-Stop
     if(!estopActive.load(std::memory_order_acquire) &&
-       (now - lastValidFrameTime > RobotConfig::COMMAND_TIMEOUT_US)) {
+       (time_us_64() - lastValidFrameTime > RobotConfig::COMMAND_TIMEOUT_US)) {
         estopActive.store(true, std::memory_order_release);
-        debugOut->println("[Move] E-Stop: command timeout!");
+        Serial.println("[Move] E-Stop: command timeout!");
     }
+
+    // 3. 讓出 CPU，給 ChassisComms IRQ 處理時間
+    delayMicroseconds(20);
 }
 
 // ============================================================================
 // 收到 Hub 控制幀的回呼 (由 ChassisComms 觸發，在 Core 0 上下文執行)
+//
+// ChassisComms::processFrame 已處理：
+//   - sync 0xA5 驗證
+//   - CRC 驗證
+//   - 幀序號去重
+//   - HEARTBEAT / ESTOP 型別檢查
+//
+// 此回呼僅處理 E-Stop 與 CONTROL 命令快照
 // ============================================================================
 static void onHubFrame(const ControlPacket& pkt) {
-    // 驗證 msgType
-    if(pkt.msgType != MsgType::CONTROL && pkt.msgType != MsgType::HEARTBEAT) {
-        return;
-    }
-
     // E-Stop 廣播處理 (agent.md §E-Stop 安全機制)
     if(pkt.msgType == MsgType::ESTOP || pkt.targetID == TargetID::BROADCAST) {
         estopActive.store(true, std::memory_order_release);
-        debugOut->println("[Move] E-Stop received from Hub!");
+        Serial.println("[Move] E-Stop received from Hub!");
+        return;
+    }
+
+    // Bypass 非控制幀 (心跳已由 ChassisComms 自行處理)
+    if(pkt.msgType != MsgType::CONTROL) {
+        return;
+    }
+
+    // 過濾非自己 mesh 的幀 (ChassisComms 已過濾 targetID，此處備援)
+    if(pkt.targetID != TargetID::MOVE && pkt.targetID != TargetID::BROADCAST) {
         return;
     }
 
@@ -493,7 +512,7 @@ static void onHubFrame(const ControlPacket& pkt) {
     // 如果 E-Stop 曾觸發，現在收到有效幀 → 解除 E-Stop
     if(estopActive.load(std::memory_order_acquire)) {
         estopActive.store(false, std::memory_order_release);
-        debugOut->println("[Move] E-Stop cleared.");
+        Serial.println("[Move] E-Stop cleared.");
     }
 
     // Release barrier：確保以上寫入在通知 Core 1 前全部可見
