@@ -19,19 +19,29 @@ void ChassisComms::begin() {
 }
 
 void ChassisComms::processFrame(const uint8_t* data, size_t len) {
+    // Check for telemetry frame (larger than ControlPacket)
+    if (len == sizeof(MoveTelemetry)) {
+        const MoveTelemetry& tm = *reinterpret_cast<const MoveTelemetry*>(data);
+        if (tm.sync == 0xA5 && tm.msgType == MsgType::TELEMETRY) {
+            if (telemetryCb != nullptr)
+                telemetryCb(tm);
+            return;
+        }
+    }
+
     if (len != sizeof(ControlPacket)) return;
 
     const ControlPacket& pkt = *reinterpret_cast<const ControlPacket*>(data);
     if (pkt.sync != 0xA5) return;
 
-    // E-Stop 為中斷事件：跳過幀序號去重，每次都必須傳遞（agent.md §E-Stop）
+    // E-Stop 為中斷事件：跳過幀序號去重，每次都必須傳遞（CLAUDE.md §E-Stop）
     if (pkt.msgType == MsgType::ESTOP) {
         if (frameCb != nullptr)
             frameCb(pkt);
         return;
     }
 
-    // 幀序號抗重複 (agent.md §幀序號抗干擾)
+    // 幀序號抗重複 (CLAUDE.md §幀序號抗干擾)
     if (!firstFrame && pkt.frameSeq == lastFrameSeq)
         return;
     firstFrame   = false;
@@ -39,6 +49,25 @@ void ChassisComms::processFrame(const uint8_t* data, size_t len) {
 
     if (frameCb != nullptr)
         frameCb(pkt);
+}
+
+bool ChassisComms::sendTelemetry(const MoveTelemetry& telemetry) {
+    if (stream == nullptr) return false;
+
+    uint8_t  cobsBuf[sizeof(MoveTelemetry) + 2];
+    size_t   cobsLen = SignalUtils::cobsEncode(
+                          reinterpret_cast<const uint8_t*>(&telemetry),
+                          sizeof(MoveTelemetry),
+                          cobsBuf);
+    cobsBuf[cobsLen] = 0x00;
+
+    size_t totalBytes = cobsLen + 1;
+
+    if (stream->availableForWrite() >= static_cast<int>(totalBytes)) {
+        size_t written = stream->write(cobsBuf, totalBytes);
+        return written == totalBytes;
+    }
+    return false;
 }
 
 bool ChassisComms::sendPacket(const ControlPacket& pkt) {
@@ -53,7 +82,7 @@ bool ChassisComms::sendPacket(const ControlPacket& pkt) {
 
     size_t totalBytes = cobsLen + 1;
 
-    // 非阻塞寫入：檢查 TX 剩餘空間 (agent.md §發送規則)
+    // 非阻塞寫入：檢查 TX 剩餘空間 (CLAUDE.md §發送規則)
     if (stream->availableForWrite() >= static_cast<int>(totalBytes)) {
         size_t written = stream->write(cobsBuf, totalBytes);
         return written == totalBytes;
@@ -92,7 +121,7 @@ void ChassisComms::update() {
                         if (storedCrc == calcCrc) {
                             processFrame(decoded, decLen);
                         }
-                        // CRC 失敗 → 靜默丟棄 (agent.md 規則)
+                        // CRC 失敗 → 靜默丟棄 (CLAUDE.md 規則)
                     }
                 }
                 workBufIdx = 0;
@@ -103,7 +132,7 @@ void ChassisComms::update() {
         }
     }
 
-    // ---- 2. 心跳 (agent.md §心跳) ----
+    // ---- 2. 心跳 (CLAUDE.md §心跳) ----
     if (hbIntervalUs == 0) return; // 停用心跳
 
     uint64_t now = time_us_64();
@@ -115,14 +144,10 @@ void ChassisComms::update() {
         pkt.msgType    = MsgType::HEARTBEAT;
         pkt.frameSeq   = txFrameSeq++;
         pkt.targetID   = hbTargetID;
-        pkt.payloadLen = sizeof(ControlPacket) - 6;
-        pkt.vx         = 0;
-        pkt.vy         = 0;
-        pkt.omega      = 0;
-        pkt.mode       = RobotMode::FAILSAFE;
-        pkt.timestamp_hi = static_cast<uint32_t>(now >> 32);
-        pkt.timestamp_lo = static_cast<uint32_t>(now & 0xFFFFFFFF);
-        pkt.crc16      = 0;
+        pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
+        pkt.move.vx    = 0;
+        pkt.move.vy    = 0;
+        pkt.move.omega = 0;
 
         pkt.crc16 = SignalUtils::calculateCrc(
                         reinterpret_cast<uint8_t*>(&pkt),

@@ -3,10 +3,15 @@
 #include <Arduino.h>
 
 // ============================================================================
-// ChassisComms — 通用 COBS 協議庫
+// ChassisComms — 通用 COBS 協議庫（支援控制與遙測）
 //
-// 根據 agent.md 規範，綁定到任意 Stream 介面，提供完整的 COBS 封幀
+// 根據 CLAUDE.md 規範，綁定到任意 Stream 介面，提供完整的 COBS 封幀
 // 收發、CRC-CCITT 驗證、幀序號去重、與 30ms 心跳。
+//
+// 遙測支援：
+//   - sendTelemetry()     向 Hub 發送 MoveTelemetry 封包（Slave 端呼叫）
+//   - setTelemetryCallback() 註冊回呼以接收解碼後的 MoveTelemetry 幀（Hub 端呼叫）
+//   - processFrame() 會自動辨識 msgType::TELEMETRY 並分發至遙測回呼
 //
 // 支援的 Stream 類型（任意實作 Stream 介面的物件）：
 //   - Serial       (USB CDC — Hub 與 Jetson 通訊)
@@ -47,6 +52,14 @@ public:
     ///   4. 若達心跳間隔 → 產生心跳 ControlPacket
     void update();
 
+    /// 收到有效解碼遙測幀時觸發的回呼
+    using TelemetryCallback = void (*)(const MoveTelemetry& telemetry);
+    void setTelemetryCallback(TelemetryCallback cb) { telemetryCb = cb; }
+
+    /// 發送 MoveTelemetry 遙測封包（COBS 編碼 + 寫入 Stream）
+    /// 由 Slave 端在 Core 1 中呼叫，將遙測資料回傳給 Hub
+    bool sendTelemetry(const MoveTelemetry& telemetry);
+
     /// 收到有效解碼幀時觸發的回呼
     using FrameCallback = void (*)(const ControlPacket& pkt);
     void setFrameCallback(FrameCallback cb) { frameCb = cb; }
@@ -71,9 +84,10 @@ private:
     size_t  workBufIdx = 0;
 
     // 幀追蹤
-    FrameCallback frameCb      = nullptr;
-    uint8_t       lastFrameSeq = 0;
-    bool          firstFrame   = true;
+    FrameCallback      frameCb      = nullptr;
+    TelemetryCallback  telemetryCb  = nullptr;
+    uint8_t            lastFrameSeq = 0;
+    bool               firstFrame   = true;
 
     // 心跳
     uint64_t lastHeartbeatTime = 0;
