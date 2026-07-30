@@ -139,7 +139,7 @@ static uint32_t medianGet(int idx) {
         return 0;
 
     // 複製並排序（插入排序，N=5 很快）
-    uint32_t tmp[MEDIAN_WINDOW];
+    uint32_t tmp[MEDIAN_WINDOW] = {};
     int n = mf->count;
     for(int i = 0; i < n; i++)
         tmp[i] = mf->buffer[i];

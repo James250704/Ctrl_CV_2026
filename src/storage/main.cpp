@@ -134,7 +134,7 @@ bool init() {
     // 內部震盪器 25MHz (typ)
     // PRE_SCALE = round(25e6 / (4096 × 50)) - 1 = round(122.07) - 1 = 121
     uint8_t preScale = 121;
-    uint8_t preBuf[2] = { Pca9685::PRE_SCALE, preScale };
+    const uint8_t preBuf[2] = { Pca9685::PRE_SCALE, preScale };
     i2c_write_blocking(i2c, Pca9685::ADDR, preBuf, 2, false);
 
     // 回到正常模式 (離開 sleep)
@@ -191,7 +191,7 @@ void setAllChannelsPulseUs(uint16_t pulseUs) {
     uint16_t offCount = pulseUsToOffCount(pulseUs);
     for (uint8_t ch = 0; ch < 16; ch++) {
         uint8_t reg = Pca9685::LED0_ON_L + ch * Pca9685::CHAN_REG_STEP;
-        uint8_t chBuf[5] = {
+        const uint8_t chBuf[5] = {
             reg,
             0x00, 0x00,
             static_cast<uint8_t>(offCount & 0xFF),

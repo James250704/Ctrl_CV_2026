@@ -67,6 +67,7 @@ void __not_in_flash_func(encoderGpioIrq)() {
         }
 
         // 檢查是否有 IRQ 觸發
+        // cppcheck-suppress badBitmaskCheck — mock 回傳 0，真實硬體回傳位元遮罩
         uint32_t irqStatus = gpio_get_irq_event_mask(pinA) |
                              gpio_get_irq_event_mask(pinB);
         if(!irqStatus) continue;

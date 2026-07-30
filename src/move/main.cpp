@@ -394,7 +394,7 @@ namespace Bmi270 {
     }
 
     static void writeReg(uint8_t reg, uint8_t val) {
-        uint8_t buf[2] = {reg, val};
+        const uint8_t buf[2] = {reg, val};
         i2c_write_blocking(i2c, ADDR, buf, 2, false);
     }
 
