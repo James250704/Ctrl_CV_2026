@@ -352,21 +352,52 @@ static void estop() {
 // ============================================================================
 // SlaveApp 回呼
 // ============================================================================
-static void onStorageCommand(const ChassisSnapshot& cmd) {
-    MotorControl::executeMotion(cmd);
-}
+static uint8_t tmFrameSeq = 0;  // 遙測幀序號
+static MoveTelemetry pendingTm = {};  // Core 1 寫入 → Core 0 發送
 
 static void onStorageEstop() {
     MotorControl::estop();
 }
 
+static void onStorageCommand(const ChassisSnapshot& cmd) {
+    MotorControl::executeMotion(cmd);
+
+    // 構建遙測封包到暫存區，由 storage wrapper 在 Core 1 中交給 SlaveComms
+    pendingTm = {};
+    pendingTm.sync       = 0xA5;
+    pendingTm.msgType    = MsgType::TELEMETRY;
+    pendingTm.frameSeq   = tmFrameSeq++;
+    pendingTm.targetID   = TargetID::HUB;
+    // Storage 遙測：復用 float 陣列
+    // currentRps[0] = motorChannel, currentRps[1] = sw, currentRps[2] = trigger
+    pendingTm.currentRps[0] = static_cast<float>(cmd.motorChannel);
+    pendingTm.currentRps[1] = static_cast<float>(cmd.sw);
+    pendingTm.currentRps[2] = static_cast<float>(cmd.trigger);
+    pendingTm.mode     = RobotMode::AUTO;
+    pendingTm.estopFlag = 0;
+    pendingTm.timestamp = time_us_64();
+    pendingTm.crc16 = 0;
+    pendingTm.crc16 = SignalUtils::calculateCrc(
+                           reinterpret_cast<const uint8_t*>(&pendingTm),
+                           sizeof(MoveTelemetry) - 2);
+}
+
+// 前向宣告：storageCommandWrapper 定義在 slave 之後
+static void storageCommandWrapper(const ChassisSnapshot& cmd);
+
 static SlaveApp storageApp = {
     .targetID  = TargetID::STORAGE,
-    .onCommand = onStorageCommand,
+    .onCommand = storageCommandWrapper,  // wrapper: onStorageCommand + 遙測發送
     .onEstop   = onStorageEstop,
 };
 
 static SlaveComms slave(&storageApp);
+
+// Wrapper：先執行 onStorageCommand，再將遙測交給 SlaveComms
+static void storageCommandWrapper(const ChassisSnapshot& cmd) {
+    onStorageCommand(cmd);
+    slave.prepareTelemetry(pendingTm);
+}
 
 // ============================================================================
 // Core 1 idle hook — 每 spinloop 迭代空閒時驅動 trigger 步進馬達

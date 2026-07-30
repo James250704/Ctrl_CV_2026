@@ -222,6 +222,7 @@ static RampedTarget rampOmega(Kinematics::ACCEL_LIMIT);
 static bool         rampInitialized = false;
 static bool         prevEstop       = false;
 static uint64_t     lastTickUs      = 0;
+static uint8_t      tmFrameSeq      = 0;  // 遙測幀序號
 
 // ============================================================================
 // wheelSetPwm — 設定一輪的 PWM duty + DIR 方向
@@ -304,6 +305,29 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
     wheels[1].targetRps = frTarget; wheels[1].pwmOutput = pwmFR;
     wheels[2].targetRps = rlTarget; wheels[2].pwmOutput = pwmRL;
     wheels[3].targetRps = rrTarget; wheels[3].pwmOutput = pwmRR;
+
+    // 構建遙測封包，交由 Core 0 定時發送
+    MoveTelemetry tm = {};
+    tm.sync       = 0xA5;
+    tm.msgType    = MsgType::TELEMETRY;
+    tm.frameSeq   = tmFrameSeq++;
+    tm.targetID   = TargetID::HUB;
+    for (int i = 0; i < 4; i++) {
+        tm.currentRps[i] = wheels[i].currentRps;
+        tm.targetRps[i]  = wheels[i].targetRps;
+        tm.pwmOutput[i]  = wheels[i].pwmOutput;
+    }
+    tm.cmdVx    = cmd.vx;
+    tm.cmdVy    = cmd.vy;
+    tm.cmdOmega = cmd.omega;
+    tm.mode     = RobotMode::AUTO;
+    tm.estopFlag = 0;
+    tm.timestamp = time_us_64();
+    tm.crc16 = 0;
+    tm.crc16 = SignalUtils::calculateCrc(
+                   reinterpret_cast<const uint8_t*>(&tm),
+                   sizeof(MoveTelemetry) - 2);
+    slave.prepareTelemetry(tm);
 }
 
 // ============================================================================

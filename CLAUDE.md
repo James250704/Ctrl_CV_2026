@@ -251,6 +251,16 @@ Storage： Hub SM2 TX(GP6) → Storage RX(GP1), Storage TX(GP0) → Hub SM2 RX(G
 - 每個 struct 後 `static_assert(sizeof(Struct) == EXPECTED_SIZE)`
 - Little-endian（RP2350 原生）
 
+### msgType 訊息類型
+
+| 值 | 常數 | 方向 | 說明 |
+|----|------|------|------|
+| 0x01 | HEARTBEAT | Hub → Jetson | 30ms 心跳（可停用） |
+| 0x02 | CONTROL | 雙向 | 控制命令（20 bytes ControlPacket） |
+| 0x03 | TELEMETRY | Slave → Hub | 遙測回傳（72 bytes MoveTelemetry，50ms 間隔） |
+| 0x04 | REBOOT | Hub → Slave | 觸發 Slave watchdog 重開機（20 bytes ControlPacket） |
+| 0xFF | ESTOP | 雙向 | 緊急停止（跳過幀序號去重，每次必傳） |
+
 ### COBS 封幀
 
 - 負載最大 254 bytes，編碼後補 `0x00` 終止符
@@ -296,9 +306,12 @@ Storage： Hub SM2 TX(GP6) → Storage RX(GP1), Storage TX(GP0) → Hub SM2 RX(G
 ### 遙測回傳
 
 - 所有 Slave 使用通訊用的同一組 **UART0 TX**，以約 **50ms 間隔**（20Hz）發送 COBS 遙測封包回 Hub
+- Slave Core 1 的 `onCommand()` callback 構建 `MoveTelemetry` → `slave.prepareTelemetry()` 交給 Core 0
+- Slave Core 0 的 `SlaveComms::update()` 定時透過 `ChassisComms::sendTelemetry()` 發送
 - 遙測包含：四輪 currentRps、targetRps、pwmOutput、車身速度命令、E-Stop 旗標
 - 使用專用 struct `MoveTelemetry`（72 bytes, packed），COBS 封幀 + CRC16
-- Hub 端 PIO UART RX 在 `ChassisComms::update()` 中接收
+- Hub 端 `processPioRx()` 解析遙測封包 → 存入 `latestXxxTm` 變數
+- Hub 端 `checkSlaveTimeouts()` 偵測遙測逾時（500ms）→ 發送 `REBOOT` 訊息觸發 Slave 重開機
 
 ---
 
@@ -332,6 +345,14 @@ Storage： Hub SM2 TX(GP6) → Storage RX(GP1), Storage TX(GP0) → Hub SM2 RX(G
 - Core 1 繼續 spinloop 等待，不 reboot
 - E-Stop 解除後收到有效控制幀自動恢復
 - Hub 端 RC CH5 = -100 → 強制歸零所有輸出（包括 Move/Shoot/Storage）
+
+### Slave 當機重開機 (REBOOT)
+
+- Hub 持續監控各 Slave 的遙測回傳時間
+- 若某 Slave 超過 **500ms** 無遙測回傳 → Hub 發送 `msgType=REBOOT` 控制幀
+- Slave Core 0 收到 REBOOT → 設定 `rebootRequested_` flag
+- Core 0 下次 `update()` 檢測到 flag → 呼叫 `watchdog_reboot(0, 0, 0)` 執行 RP2350 標準重開機
+- 重開機後 Slave 從 `setup()` 重新初始化，Hub 等待新遙測恢復連線
 
 ---
 
@@ -398,7 +419,7 @@ UART0 @ 420000 baud
 - 步進馬達: PITCH_STEP(GP5), PITCH_DIR(GP6), ROW_STEP(GP7), ROW_DIR(GP8), STEPPER_ENABLE(GP9)
 - 無刷馬達脈衝: 1500μs = 中立/停止, 2000μs = 全速
 - 步進配置: 1.8°/step, 全步進
-- upSpeed/downSpeed 為永久性速度設定（記憶於 RAM 中，未來可擴展 EEPROM 持久化）
+- upSpeed/downSpeed 為永久性速度設定（EEPROM 持久化，每次開機自動恢復）
 
 ### 4. Storage Slave 節點腳位與參數
 - UART0: TX: GP0, RX: GP1 (與 Hub 通訊)

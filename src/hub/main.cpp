@@ -96,13 +96,66 @@ static PioRxBuffer shootRxBuf;
 static PioRxBuffer storageRxBuf;
 
 // ============================================================================
+// 遙測資料儲存 — Hub 解析 Slave 回傳的 MoveTelemetry 後存入此處
+// 供 Core 0 主迴圈或其他模組讀取。
+// ============================================================================
+static MoveTelemetry latestMoveTm    = {};
+static MoveTelemetry latestShootTm   = {};
+static MoveTelemetry latestStorageTm = {};
+static uint64_t lastMoveTmUs    = 0;  // 0 = 從未收到
+static uint64_t lastShootTmUs   = 0;
+static uint64_t lastStorageTmUs = 0;
+
+// ============================================================================
+// Slave 當機偵測逾時時間
+// 收到首次遙測後，若超過此時間無新遙測 → 發送 REBOOT 訊息。
+// ============================================================================
+static constexpr uint64_t SLAVE_TELEMETRY_TIMEOUT_US = 500000ULL;  // 500ms
+
+// ============================================================================
+// 輔助函式：COBS 解碼（inline，從原始 COBS 位元組流解碼）
+// 回傳解碼後的位元組數，失敗回傳 0。
+// ============================================================================
+static size_t cobsDecodeInline(const uint8_t* src, size_t len, uint8_t* dst, size_t dstSize) {
+    size_t readIdx  = 0;
+    size_t writeIdx = 0;
+
+    while (readIdx < len) {
+        uint8_t code = src[readIdx];
+        size_t  blockLen = static_cast<size_t>(code);
+
+        // 來源位元組不足
+        if (readIdx + blockLen > len)
+            return 0;
+        readIdx++;
+
+        // 目的溢位
+        if (writeIdx + (blockLen - 1) > dstSize)
+            return 0;
+
+        for (uint8_t i = 1; i < code; i++)
+            dst[writeIdx++] = src[readIdx++];
+
+        // 插入隱含的零值（非最後區塊）
+        if (code < 0xFF && readIdx < len) {
+            if (writeIdx >= dstSize)
+                return 0;
+            dst[writeIdx++] = 0x00;
+        }
+    }
+    return writeIdx;
+}
+
+// ============================================================================
 // 輔助函式：處理 PIO UART RX 收到的位元組
 //
 // 從指定 SerialPIO 讀取可用位元組，暫存至對應的 PioRxBuffer。
-// 遇到 0x00 終止符時進行 COBS 解碼 + CRC 驗證，並在目前階段
-// 透過 Serial.printf 輸出解碼結果供開發用。
+// 遇到 0x00 終止符時進行 COBS 解碼 + CRC 驗證：
+//   - 72 bytes + TELEMETRY → 存入 telemetryOut，更新 lastTmUs
+//   - 20 bytes + CONTROL/ESTOP/HEARTBEAT → Serial.printf log（保留除錯用）
 // ============================================================================
-static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name) {
+static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
+                         MoveTelemetry& telemetryOut, uint64_t& lastTmUs) {
     while (uart.available() > 0) {
         uint8_t byte = static_cast<uint8_t>(uart.read());
 
@@ -112,88 +165,51 @@ static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name) 
                 continue;
             }
 
-            // COBS 解碼：rxBuf.buf[0..len-1] 包含 COBS 編碼資料
-            // (含末尾的 0x00 終止符已排除，所以 buf 內容是去除最後 0x00 的編碼資料)
-            uint8_t decoded[256];
-            size_t decodedLen = 0;
+            // COBS 解碼
+            uint8_t decoded[512];
+            size_t decodedLen = cobsDecodeInline(rxBuf.buf, rxBuf.len,
+                                                decoded, sizeof(decoded));
 
-            // COBS 解碼實作
-            const uint8_t* src = rxBuf.buf;
-            size_t remaining = rxBuf.len;
-            bool decodeOk = false;
-
-            if (remaining > 0 && remaining <= 254) {
-                decodedLen = 0;
-                decodeOk = true;
-
-                while (remaining > 0) {
-                    uint8_t code = *src++;
-                    remaining--;
-
-                    // 複製 code-1 個非零位元組
-                    for (uint8_t i = 1; i < code && remaining > 0; i++) {
-                        if (decodedLen >= sizeof(decoded)) {
-                            decodeOk = false;
-                            break;
-                        }
-                        uint8_t val = *src++;
-                        remaining--;
-                        if (val == 0x00) {
-                            // COBS 編碼不應包含 0x00（除了終止符）
-                            decodeOk = false;
-                            break;
-                        }
-                        decoded[decodedLen++] = val;
-                    }
-                    if (!decodeOk) break;
-
-                    // 如果 code < 0xFF，則此處原本有 0x00（終止符位於最末，故中途遇到表示資料中有 0x00）
-                    if (code < 0xFF) {
-                        if (remaining == 0) {
-                            // 正常結束：這是最後一個區塊
-                            break;
-                        }
-                        // 在中間遇到 0x00，這是有效資料（原本是 0x00 被編碼）
-                        if (decodedLen >= sizeof(decoded)) {
-                            decodeOk = false;
-                            break;
-                        }
-                        decoded[decodedLen++] = 0x00;
-                    }
-                }
+            if (decodedLen == 0) {
+                Serial.printf("[PIO RX][%s] COBS decode fail: bufLen=%u\n",
+                              name, rxBuf.len);
+                rxBuf.len = 0;
+                continue;
             }
 
-            if (decodeOk && decodedLen >= 6 + 2) { // 至少 sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
-                // CRC 驗證
-                uint16_t storedCrc;
-                uint16_t payloadLen;
-                uint8_t  msgType;
-                uint8_t  frameSeq;
-                uint8_t  targetID;
+            // CRC 驗證
+            if (decodedLen < 8) {  // 最小: sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
+                Serial.printf("[PIO RX][%s] too short: %zu bytes\n", name, decodedLen);
+                rxBuf.len = 0;
+                continue;
+            }
 
-                // 從 decoded 中提取欄位
-                // Header: sync(1), msgType(1), frameSeq(1), targetID(1), payloadLen(2), crc16(2)
-                msgType    = decoded[1];
-                frameSeq   = decoded[2];
-                targetID   = decoded[3];
-                payloadLen = static_cast<uint16_t>(decoded[4]) | (static_cast<uint16_t>(decoded[5]) << 8);
-                storedCrc  = static_cast<uint16_t>(decoded[decodedLen - 2]) | (static_cast<uint16_t>(decoded[decodedLen - 1]) << 8);
+            uint16_t storedCrc = static_cast<uint16_t>(decoded[decodedLen - 2])
+                               | (static_cast<uint16_t>(decoded[decodedLen - 1]) << 8);
+            uint16_t calcCrc = SignalUtils::calculateCrc(decoded, decodedLen - 2);
 
-                uint8_t crcInput[decodedLen - 2];
-                memcpy(crcInput, decoded, decodedLen - 2);
-                uint16_t calcCrc = SignalUtils::calculateCrc(crcInput, decodedLen - 2);
+            if (calcCrc != storedCrc) {
+                Serial.printf("[PIO RX][%s] CRC mismatch (calc=0x%04X, stored=0x%04X)\n",
+                              name, calcCrc, storedCrc);
+                rxBuf.len = 0;
+                continue;
+            }
 
-                if (calcCrc == storedCrc) {
-                    // CRC 驗證通過
-                    Serial.printf("[PIO RX][%s] msgType=%d, frameSeq=%d, targetID=%d, payloadLen=%d, total=%zu bytes\n",
-                                  name, msgType, frameSeq, targetID, payloadLen, decodedLen);
-                } else {
-                    Serial.printf("[PIO RX][%s] CRC mismatch (calc=0x%04X, stored=0x%04X), %zu bytes\n",
-                                  name, calcCrc, storedCrc, decodedLen);
-                }
+            // CRC 通過 — 依大小分發
+            if (decodedLen == sizeof(MoveTelemetry)) {
+                // 遙測封包 (72 bytes)
+                memcpy(&telemetryOut, decoded, sizeof(MoveTelemetry));
+                lastTmUs = time_us_64();
+                Serial.printf("[PIO RX][%s] telemetry OK: frameSeq=%d, timestamp=%lu\n",
+                              name, telemetryOut.frameSeq,
+                              static_cast<unsigned long>(telemetryOut.timestamp));
+            } else if (decodedLen >= sizeof(ControlPacket)) {
+                // 控制/心跳/E-Stop 封包 (20 bytes)
+                const ControlPacket& pkt = *reinterpret_cast<const ControlPacket*>(decoded);
+                Serial.printf("[PIO RX][%s] pkt: msgType=%d, frameSeq=%d, targetID=%d\n",
+                              name, pkt.msgType, pkt.frameSeq, pkt.targetID);
             } else {
-                Serial.printf("[PIO RX][%s] decode fail or too short: bufLen=%u, decodedLen=%zu\n",
-                              name, rxBuf.len, decodedLen);
+                Serial.printf("[PIO RX][%s] unknown frame: %zu bytes\n", name, decodedLen);
             }
 
             rxBuf.len = 0; // 重置緩衝區
@@ -224,6 +240,50 @@ static ChassisComms jetsonComms(&Serial, TargetID::HUB);
 static ChassisComms moveComms(&moveUart, TargetID::MOVE,    0);
 static ChassisComms shootComms(&shootUart, TargetID::SHOOT,  0);
 static ChassisComms storageComms(&storageUart, TargetID::STORAGE, 0);
+
+// ============================================================================
+// Slave 當機偵測 + 發送 REBOOT 訊息
+//
+// 若某 Slave 會回傳遙測（lastTmUs > 0）但超過500ms 無新資料，
+// 則透過對應的 ChassisComms 發送 REBOOT 訊息觸發 slave 重開機。
+// 發送後將 lastTmUs 歸零，避免重複 reboot。
+// ============================================================================
+static void sendReboot(ChassisComms& comms, uint8_t targetID) {
+    ControlPacket reboot = {};
+    reboot.sync       = 0xA5;
+    reboot.msgType    = MsgType::REBOOT;
+    reboot.frameSeq   = 0;
+    reboot.targetID   = targetID;
+    reboot.payloadLen = sizeof(ControlPacket) - 6 - 2;
+    reboot.crc16 = 0;
+    reboot.crc16 = SignalUtils::calculateCrc(
+                       reinterpret_cast<const uint8_t*>(&reboot),
+                       sizeof(ControlPacket) - 2);
+    comms.sendPacket(reboot);
+    Serial.printf("[HUB] Sent REBOOT to targetID=%d\n", targetID);
+}
+
+static void checkSlaveTimeouts() {
+    uint64_t now = time_us_64();
+
+    // Move Slave
+    if (lastMoveTmUs > 0 && (now - lastMoveTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
+        sendReboot(moveComms, TargetID::MOVE);
+        lastMoveTmUs = 0;
+    }
+
+    // Shoot Slave
+    if (lastShootTmUs > 0 && (now - lastShootTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
+        sendReboot(shootComms, TargetID::SHOOT);
+        lastShootTmUs = 0;
+    }
+
+    // Storage Slave
+    if (lastStorageTmUs > 0 && (now - lastStorageTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
+        sendReboot(storageComms, TargetID::STORAGE);
+        lastStorageTmUs = 0;
+    }
+}
 
 // ============================================================================
 // 遙控接收機 — Core 1 專用，使用 UART0 (GP1 RX) @ 420000 baud
@@ -473,19 +533,26 @@ void setup() {
 }
 
 // ============================================================================
-// Core 0: loop() — 自動駕駛與路由大腦 + PIO RX 接收
+// Core 0: loop() — 自動駕駛與路由大腦 + PIO RX 接收 + 遙測監控
 //
 // 1. jetsonComms.update() → USB CDC 讀取 + COBS 解包 + 回呼轉發 + 30ms 心跳
 // 2. PIO UART RX 輪詢 — 接收各 Slave 回傳的 COBS 遙測幀
-// 3. 如果 Jetson 逾時 >500ms → 切換至 RC 備援
+// 3. Slave 當機偵測 — 超過500ms 無遙測 → 發送 REBOOT
+// 4. 如果 Jetson 逾時 >500ms → 切換至 RC 備援
 // ============================================================================
 void loop() {
     jetsonComms.update();
 
     // 輪詢各 PIO UART RX，接收 Slave 回傳的 COBS 遙測幀
-    processPioRx(moveUart,    moveRxBuf,    "Move");
-    processPioRx(shootUart,   shootRxBuf,   "Shoot");
-    processPioRx(storageUart, storageRxBuf, "Storage");
+    processPioRx(moveUart,    moveRxBuf,    "Move",
+                 latestMoveTm,    lastMoveTmUs);
+    processPioRx(shootUart,   shootRxBuf,   "Shoot",
+                 latestShootTm,   lastShootTmUs);
+    processPioRx(storageUart, storageRxBuf, "Storage",
+                 latestStorageTm, lastStorageTmUs);
+
+    // Slave 當機偵測：逾時500ms 無遙測 → 發送 REBOOT
+    checkSlaveTimeouts();
 
     uint64_t now = time_us_64();
     if (now - lastJetsonFrameUs > RobotConfig::HEARTBEAT_TIMEOUT_US) {

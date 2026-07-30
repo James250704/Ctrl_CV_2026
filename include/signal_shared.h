@@ -45,6 +45,7 @@ namespace MsgType {
 constexpr uint8_t HEARTBEAT  = 0x01;
 constexpr uint8_t CONTROL    = 0x02;
 constexpr uint8_t TELEMETRY  = 0x03;
+constexpr uint8_t REBOOT     = 0x04;  // Hub → Slave：觸發 watchdog 重開機
 constexpr uint8_t ESTOP      = 0xFF;
 } // namespace MsgType
 

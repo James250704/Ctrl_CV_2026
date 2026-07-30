@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <atomic>
 #include <cstring>
+#include <hardware/watchdog.h>
 
 // ============================================================================
 // SlaveComms — 通用 Slave 雙核心通訊框架
@@ -99,9 +100,16 @@ public:
 
     /// Core 0 主迴圈（在 loop() 中呼叫）
     ///
-    /// 1. ChassisComms::update() → 收 COBS 幀 → CRC 驗證 → 回呼分發
-    /// 2. 100ms 逾時檢查 → E-Stop
+    /// 1. 檢查 Reboot 旗標 → watchdog 重開機
+    /// 2. ChassisComms::update() → 收 COBS 幀 → CRC 驗證 → 回呼分發
+    /// 3. 100ms 逾時檢查 → E-Stop
+    /// 4. 發送遙測（每50ms 一次）
     void update() {
+        // Reboot 優先：收到 Hub 的 REBOOT 訊息後立即重開機
+        if (rebootRequested_) {
+            watchdog_reboot(0, 0, 0);  // RP2350 watchdog 立即標準重開機
+        }
+
         hubComms_.update();
 
         uint64_t now = time_us_64();
@@ -109,6 +117,9 @@ public:
             (now - lastValidCmdTime_ > RobotConfig::COMMAND_TIMEOUT_US)) {
             triggerEstop();
         }
+
+        // 遙測定時發送（50ms 間隔 = 20Hz）
+        sendTelemetryIfReady();
 
         delayMicroseconds(20);
     }
@@ -178,6 +189,14 @@ public:
     /// 取得 ChassisComms 參考（用於自訂收發）
     ChassisComms& comms() { return hubComms_; }
 
+    /// Core 1 呼叫：準備遙測資料，由 Core 0 在下次 update() 中發送。
+    /// 在 onCommand() callback 中構建 MoveTelemetry 後呼叫此方法。
+    /// 使用 memcpy + atomic flag 進行跨核心傳遞。
+    void prepareTelemetry(const MoveTelemetry& tm) {
+        memcpy(&pendingTelemetry_, &tm, sizeof(MoveTelemetry));
+        telemetryReady_.store(true, std::memory_order_release);
+    }
+
 private:
     SlaveComms(const SlaveComms&) = delete;
     SlaveComms& operator=(const SlaveComms&) = delete;
@@ -194,6 +213,13 @@ private:
         // E-Stop 廣播 — 優先處理（CLAUDE.md §E-Stop 安全機制）
         if (pkt.msgType == MsgType::ESTOP) {
             triggerEstop();
+            return;
+        }
+
+        // Reboot 指令 — Hub 偵測到本 Slave 遙測逾時時發送
+        if (pkt.msgType == MsgType::REBOOT) {
+            if (instance_ != nullptr)
+                instance_->rebootRequested_ = true;
             return;
         }
 
@@ -258,9 +284,38 @@ private:
     static inline std::atomic<bool> estopActive_{false};
     static inline uint64_t lastValidCmdTime_ = 0;
 
+    // 遙測：Core 1 寫入 → Core 0 發送（單緩衝 + atomic flag）
+    static constexpr uint64_t TELEMETRY_INTERVAL_US = 50000ULL;  // 50ms = 20Hz
+    MoveTelemetry pendingTelemetry_{};
+    std::atomic<bool> telemetryReady_{false};
+    uint64_t lastTelemetrySendUs_ = 0;
+
+    // Reboot：Hub 發送 REBOOT → Core 0 執行 watchdog 重開機
+    volatile bool rebootRequested_ = false;
+
     // static this 指標供 thunk 使用
     static inline SlaveComms* instance_ = nullptr;
 
     // Core 1 空閒回呼（不為 null 時每次 spinloop 迭代非命令/非 E-Stop 時呼叫）
     void (*idleHook_)() = nullptr;
+
+    // ========================================================================
+    // 遙測定時發送（Core 0 context）
+    // ========================================================================
+    void sendTelemetryIfReady() {
+        if (!telemetryReady_.load(std::memory_order_acquire))
+            return;
+
+        uint64_t now = time_us_64();
+        if (now - lastTelemetrySendUs_ < TELEMETRY_INTERVAL_US)
+            return;
+
+        // 準備快照並發送
+        MoveTelemetry snapshot;
+        memcpy(&snapshot, &pendingTelemetry_, sizeof(MoveTelemetry));
+        telemetryReady_.store(false, std::memory_order_release);
+
+        hubComms_.sendTelemetry(snapshot);
+        lastTelemetrySendUs_ = now;
+    }
 };

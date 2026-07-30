@@ -29,6 +29,7 @@
 #include "SlaveComms.h"
 #include <Arduino.h>
 #include <cmath>
+#include <EEPROM.h>
 #include <hardware/pwm.h>
 #include <pico/stdlib.h>
 
@@ -60,30 +61,39 @@ constexpr float INPUT_TO_DEG    = 90.0f / 100.0f;  // 0.9 deg/input
 } // namespace StepperConfig
 
 // ============================================================================
-// BLDC 速度持久化儲存
+// BLDC 速度持久化儲存（EEPROM 模擬）
+//
+// earlephilhower Arduino-Pico core 的 EEPROM 使用內部 Flash 模擬，
+// begin() 分配 RAM 緩衝區，put() 寫入緩衝區，commit() 寫入 Flash。
+// RP2350 支援 Flash 擦寫（wear leveling 由 core 內部處理）。
 // ============================================================================
 namespace SpeedStorage {
+constexpr int EEPROM_SIZE    = 16;  // 預留空間
+constexpr int ADDR_UP_SPEED  = 0;   // float, 4 bytes
+constexpr int ADDR_DOWN_SPEED = 4;  // float, 4 bytes
+
 static float persistentUpSpeed   = 0.0f;
 static float persistentDownSpeed = 0.0f;
 
 void init() {
-    // TODO: 使用 EEPROM 持久化
-    // #include <EEPROM.h>
-    // EEPROM.begin(64);
-    // EEPROM.get(0, persistentUpSpeed);
-    // EEPROM.get(4, persistentDownSpeed);
-    persistentUpSpeed   = 0.0f;
-    persistentDownSpeed = 0.0f;
+    EEPROM.begin(EEPROM_SIZE);
+    EEPROM.get(ADDR_UP_SPEED, persistentUpSpeed);
+    EEPROM.get(ADDR_DOWN_SPEED, persistentDownSpeed);
+    // 若 flash 尚未初始化（全 0xFF），float 會是 NaN → 歸零
+    if (std::isnan(persistentUpSpeed))   persistentUpSpeed = 0.0f;
+    if (std::isnan(persistentDownSpeed)) persistentDownSpeed = 0.0f;
 }
 
 void saveUpSpeed(float speed) {
     persistentUpSpeed = speed;
-    // TODO: EEPROM.put(0, speed); EEPROM.commit();
+    EEPROM.put(ADDR_UP_SPEED, speed);
+    EEPROM.commit();
 }
 
 void saveDownSpeed(float speed) {
     persistentDownSpeed = speed;
-    // TODO: EEPROM.put(4, speed); EEPROM.commit();
+    EEPROM.put(ADDR_DOWN_SPEED, speed);
+    EEPROM.commit();
 }
 
 float getUpSpeed()   { return persistentUpSpeed; }
@@ -211,6 +221,9 @@ void estop() {
 // ============================================================================
 // SlaveApp 回呼
 // ============================================================================
+static uint8_t tmFrameSeq = 0;  // 遙測幀序號
+static MoveTelemetry pendingTm = {};  // Core 1 寫入 → Core 0 發送
+
 static void onShootCommand(const ChassisSnapshot& cmd) {
     // 永久性速度：每次命令都儲存並套用（包括速度=0的清零指令）
     SpeedStorage::saveUpSpeed(cmd.shootUpSpeed);
@@ -221,6 +234,26 @@ static void onShootCommand(const ChassisSnapshot& cmd) {
     // 步進目標位置
     StepperControl::setPitchTarget(cmd.pitch);
     StepperControl::setRowTarget(cmd.row);
+
+    // 構建遙測封包到暫存區，由 slave wrapper 在 Core 1 中交給 SlaveComms
+    pendingTm = {};
+    pendingTm.sync       = 0xA5;
+    pendingTm.msgType    = MsgType::TELEMETRY;
+    pendingTm.frameSeq   = tmFrameSeq++;
+    pendingTm.targetID   = TargetID::HUB;
+    // Shoot 遙測：復用 float 陣列
+    // currentRps[0] = 上輪速度, currentRps[1] = 下輪速度
+    pendingTm.currentRps[0] = cmd.shootUpSpeed;
+    pendingTm.currentRps[1] = cmd.shootDownSpeed;
+    pendingTm.targetRps[0]  = cmd.shootUpSpeed;
+    pendingTm.targetRps[1]  = cmd.shootDownSpeed;
+    pendingTm.mode     = RobotMode::AUTO;
+    pendingTm.estopFlag = 0;
+    pendingTm.timestamp = time_us_64();
+    pendingTm.crc16 = 0;
+    pendingTm.crc16 = SignalUtils::calculateCrc(
+                           reinterpret_cast<const uint8_t*>(&pendingTm),
+                           sizeof(MoveTelemetry) - 2);
 }
 
 static void onShootEstop() {
@@ -228,13 +261,22 @@ static void onShootEstop() {
     StepperControl::estop();
 }
 
+// 前向宣告：shootCommandWrapper 定義在 slave 之後
+static void shootCommandWrapper(const ChassisSnapshot& cmd);
+
 static SlaveApp shootApp = {
     .targetID  = TargetID::SHOOT,
-    .onCommand = onShootCommand,
+    .onCommand = shootCommandWrapper,  // wrapper: onShootCommand + 遙測發送
     .onEstop   = onShootEstop,
 };
 
+// Wrapper：先執行 onShootCommand，再將遙測交給 SlaveComms
 static SlaveComms slave(&shootApp);
+
+static void shootCommandWrapper(const ChassisSnapshot& cmd) {
+    onShootCommand(cmd);
+    slave.prepareTelemetry(pendingTm);
+}
 
 // ============================================================================
 // Core 1 idle hook — 每 spinloop 迭代空閒時驅動步進馬達
