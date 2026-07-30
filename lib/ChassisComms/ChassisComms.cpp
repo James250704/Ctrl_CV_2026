@@ -112,12 +112,13 @@ void ChassisComms::update() {
                                                               workBufIdx,
                                                               decoded);
                     if (decLen >= sizeof(ControlPacket)) {
+                        // CRC 計算範圍：整個解碼後的資料除去尾部2 bytes (crc16)
                         uint16_t storedCrc =
-                            reinterpret_cast<const ControlPacket*>(
-                                decoded)->crc16;
+                            reinterpret_cast<const uint16_t*>(
+                                decoded + decLen - 2)[0];
                         uint16_t calcCrc = SignalUtils::calculateCrc(
                                                decoded,
-                                               sizeof(ControlPacket) - 2);
+                                               decLen - 2);
                         if (storedCrc == calcCrc) {
                             processFrame(decoded, decLen);
                         }
