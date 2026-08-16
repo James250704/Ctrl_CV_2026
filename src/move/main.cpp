@@ -1,186 +1,100 @@
 // ============================================================================
-// Move Slave — 四輪麥克納姆輪控制韌體 (RP2350)
+// Move Slave — 四輪麥克納姆輪 開迴路 PWM 控制 (RP2040)
 //
-// 根據 CLAUDE.md 雙核架構規範：
-//   Core 0 (loop):    SlaveComms::update() — 收 Hub 控制幀 → 解命令
-//   Core 1 (loop1):   SlaveComms::runCore1() — 自旋等待命令，執行
-//                      Mecanum 運動學解算 + 四輪獨立 PID 控制
+// 依 CLAUDE.md 雙核架構：Hub → COBS 控制幀 → Move UART0 收命令。
+// 控制核心：純開迴路 PWM（無 PID、無編碼器回授）：
+//   - Core 0 (loop):    SlaveComms::update() — 收 Hub 命令
+//   - Core 1 (loop1):   SlaveComms::runCore1() — 執行開迴路 PWM 控制
 //
 // 通訊（CLAUDE.md §通訊協議）：
-//   Hub PIO UART SM0 (GP6 TX, GP7 RX) ↔ Move UART0 (TX=GP0, RX=GP1)
+//   Hub PIO UART SM0 (GP2 TX, GP3 RX) ↔ Move UART0 (TX=GP0, RX=GP1)
 //   921600 baud, COBS 封幀 + CRC16
-//   接線：Hub SM0 TX(GP6) → Move RX(GP1)
-//         Move TX(GP0) → Hub SM0 RX(GP7)
+//   接線：Hub SM0 TX(GP2) → Move UART0 RX(GP1)
+//         Move UART0 TX(GP0) → Hub SM0 RX(GP3)
 //
-// 硬體配置（每輪）：
-//   - 硬體 PWM + DIR pin（取代 PIO PWM，CLAUDE.md 腳位規格）
-//   - 一組 PIO Quadrature Encoder (1 個 SM)
-//   - 四輪總計：4×Encoder = 4 SM (PIO0)
-//   - BMI270 IMU on I2C0 (GP4=SDA, GP5=SCL)
+// 硬體腳位（新接線）：
+//   馬達   PWM + DIR:   FL(10,11) FR(12,13) BL(8,9)  BR(6,7)
+//   編碼器 PIO0 4 SM（僅讀取顯示，不參與控制）:
+//                       FL(18,19) FR(20,21) BL(16,17) BR(14,15)
+//
+// 控制方式：
+//   車身速度 [vx,vy,ω]（RPS，來自 Hub 的 ChassisSnapshot）
+//      → 麥克納姆輪運動學 → 四輪目標線速度
+//      → 線速度→duty 比例 (DUTY_PER_MPS) → 目標 duty%
+//      → 線性斜率(ramp)平順爬升 → 硬體 PWM + DIR
+//
+// 實際控制測試：開機 500ms 無 Jetson 後，Hub 依遙控器 CH0/CH1/CH7
+// 送 vx/vy/omega 至本 Slave，馬達即依此轉動。
 // ============================================================================
 #include "SlaveComms.h"
 #include <Arduino.h>
 #include <cmath>
-#include <hardware/clocks.h>
-#include <hardware/i2c.h>
-#include <hardware/irq.h>
 #include <hardware/pio.h>
 #include <hardware/pwm.h>
-#include <hardware/timer.h>
-#include <pico/multicore.h>
 #include <pico/stdlib.h>
 
 // ============================================================================
-// 腳位定義 (依 CLAUDE.md 硬體規格)
+// 腳位定義（新接線）
 // ============================================================================
 namespace Pin {
-// 硬體 UART0 — 與 Hub 通訊
-// 預設腳位 TX=GP0, RX=GP1（SlaveComms 內部已處理）
-// 接線：Hub PIO SM0 TX(GP2) → Move RX(GP1)
-//       Move TX(GP0) → Hub PIO SM0 RX(GP3)
+// 硬體 UART0 — 與 Hub 通訊（SlaveComms 內部處理 TX=GP0, RX=GP1）
 
-// PWM+DIR for 4 wheels
-// FL — Front Left
-constexpr uint MOTOR_FL_PWM = 6;
-constexpr uint MOTOR_FL_DIR = 7;
-// FR — Front Right
-constexpr uint MOTOR_FR_PWM = 8;
-constexpr uint MOTOR_FR_DIR = 9;
-// BL — Back Left
-constexpr uint MOTOR_BL_PWM = 10;
-constexpr uint MOTOR_BL_DIR = 11;
-// BR — Back Right
-constexpr uint MOTOR_BR_PWM = 12;
-constexpr uint MOTOR_BR_DIR = 13;
+// PWM + DIR for 4 wheels（新接線）
+constexpr uint MOTOR_FL_PWM = 10;
+constexpr uint MOTOR_FL_DIR = 11;
+constexpr uint MOTOR_FR_PWM = 12;
+constexpr uint MOTOR_FR_DIR = 13;
+constexpr uint MOTOR_BL_PWM = 8;
+constexpr uint MOTOR_BL_DIR = 9;
+constexpr uint MOTOR_BR_PWM = 6;
+constexpr uint MOTOR_BR_DIR = 7;
 
-// Encoder pins (CLAUDE.md spec)
-// FL: A=GP14, B=GP15
-// FR: A=GP16, B=GP17
-// BL: A=GP18, B=GP19
-// BR: A=GP20, B=GP21
-constexpr uint MOTOR_FL_ENC_A = 14;
-constexpr uint MOTOR_FL_ENC_B = 15;
-constexpr uint MOTOR_FR_ENC_A = 16;
-constexpr uint MOTOR_FR_ENC_B = 17;
-constexpr uint MOTOR_BL_ENC_A = 18;
-constexpr uint MOTOR_BL_ENC_B = 19;
-constexpr uint MOTOR_BR_ENC_A = 20;
-constexpr uint MOTOR_BR_ENC_B = 21;
-
-// BMI270 IMU I2C
-constexpr uint IMU_SDA = 4;
-constexpr uint IMU_SCL = 5;
+// Encoder pins（新接線，僅顯示）base pin，B = base+1
+constexpr uint MOTOR_FL_ENC = 18;
+constexpr uint MOTOR_FR_ENC = 20;
+constexpr uint MOTOR_BL_ENC = 16;
+constexpr uint MOTOR_BR_ENC = 14;
 } // namespace Pin
 
 // ============================================================================
-// 運動學參數
+// 參數
 // ============================================================================
-namespace Kinematics {
-// 車身半長 (m) — 依實際車體修改
-constexpr float HALF_LENGTH   = 0.25f;
-// 車身半寬 (m)
-constexpr float HALF_WIDTH    = 0.25f;
-// 輪半徑 (m)
-constexpr float WHEEL_RADIUS  = 0.05f;
-// 從 (vx, vy, omega) 算到各輪期望轉速 (rad/s)
-constexpr float L_PLUS_W      = HALF_LENGTH + HALF_WIDTH;
-constexpr float INV_R         = 1.0f / WHEEL_RADIUS;
-// Feedforward 增益：rps → PWM duty 的開迴路增益
-constexpr float kFF           = 7.0f;
-// 車身加速度 ramping 限制 (RPS/s²)
-constexpr float ACCEL_LIMIT   = 20.0f;
+namespace MoveCfg {
+// 硬體 PWM wrap（解析度）— 對齊 motor.h：wrap=1000, clkdiv=6.25 → ~20kHz
+constexpr uint16_t PWM_WRAP = 1000;
+// 開迴路 duty 斜率（每秒可變動 duty% 最大值）
+constexpr float RAMP_RATE_PERCENT_PER_SEC = 100.0f;
+// 線性斜率更新週期
+constexpr uint32_t PWM_CTRL_MS = 5;
+// 麥克納姆：車身半長/半寬/輪半徑 (m)
+constexpr float HALF_LENGTH  = 0.25f;
+constexpr float HALF_WIDTH   = 0.25f;
+constexpr float WHEEL_RADIUS = 0.05f;
+// 開迴路「車輪線速度(m/s) → duty%」比例（無回授近似，依實際調整）
+constexpr float DUTY_PER_MPS = 60.0f;
+} // namespace MoveCfg
 
-inline void computeWheelTargets(float vx, float vy, float omega,
-                                float& fl, float& fr, float& rl, float& rr) {
-    float lwOmega = L_PLUS_W * omega;
-    fl = (vx - vy - lwOmega) * INV_R;
-    fr = (vx + vy + lwOmega) * INV_R;
-    rl = (vx + vy - lwOmega) * INV_R;
-    rr = (vx - vy + lwOmega) * INV_R;
-}
-
-inline float feedforward(float targetRps) { return targetRps / kFF; }
-} // namespace Kinematics
+// 每輪極性：1=依運動學符號，-1=馬達 forward 對映反轉（依實焊/線路校正）
+// 指數 0=FL 1=FR 2=BL 3=BR
+// 對齊你貼的參考主程式 g_pol 實作
+static const int8_t kWheelPolarity[4] = {1, -1, 1, -1};
 
 // ============================================================================
-// PID + Feedforward 控制器
-// ============================================================================
-class PidController {
-public:
-    float kp = 1.5f, ki = 0.0f, kd = 0.0f;
-    float outLimit = RobotConfig::PID_OUT_LIMIT;
-    float integralLimit = 5.0f;
-
-    void reset() {
-        integral_ = 0.0f;
-        prevError_ = 0.0f;
-        firstRun_ = true;
-    }
-
-    float update(float setpoint, float measurement, float dt) {
-        float error = setpoint - measurement;
-        if (firstRun_) { prevError_ = error; firstRun_ = false; }
-
-        float pTerm = kp * error;
-        integral_ += ki * error * dt;
-        if (integral_ > integralLimit) integral_ = integralLimit;
-        if (integral_ < -integralLimit) integral_ = -integralLimit;
-        float dTerm = kd * (error - prevError_) / dt;
-        prevError_ = error;
-
-        float pidOut = pTerm + integral_ + dTerm;
-        float ffOut = Kinematics::feedforward(setpoint);
-        float output = pidOut + ffOut;
-
-        if (output > outLimit) output = outLimit;
-        if (output < -outLimit) output = -outLimit;
-        return output;
-    }
-
-private:
-    float integral_ = 0.0f;
-    float prevError_ = 0.0f;
-    bool firstRun_ = true;
-};
-
-// ============================================================================
-// RampedTarget — 車身速度層加速度漸變
-// ============================================================================
-class RampedTarget {
-public:
-    explicit RampedTarget(float maxDeltaPerSec) : maxDelta_(maxDeltaPerSec) {}
-    void reset(float value = 0.0f) { previous_ = value; }
-    float update(float target, float dt) {
-        float maxStep = maxDelta_ * dt;
-        float diff = target - previous_;
-        if (diff > maxStep) diff = maxStep;
-        if (diff < -maxStep) diff = -maxStep;
-        previous_ += diff;
-        return previous_;
-    }
-private:
-    float maxDelta_;
-    float previous_ = 0.0f;
-};
-
-// ============================================================================
-// 四輪狀態
+// 四輪狀態 — 開迴路
 // ============================================================================
 struct WheelState {
-    uint pwmPin;         // 硬體 PWM GPIO
-    uint dirPin;         // DIR GPIO
-    uint encSm;
-    PIO pioBlock;
-    PidController pid;
-    volatile int32_t encoderCount;
-    float currentRps = 0.0f;
-    float targetRps = 0.0f;
-    float pwmOutput = 0.0f;
+    uint pwmPin;
+    uint dirPin;
+    uint encPin;             // encoder base pin（僅顯示）
+    float targetDuty = 0.0f; // 目標 duty% (-100~100)
+    float outDuty    = 0.0f; // 實際輸出 duty%（斜坡逼近）
+    int32_t encCount = 0;    // 編碼器計數（僅顯示）
 };
 static WheelState wheels[4];
+static uint64_t lastTickUs = 0;   // Core 1 控制週期時間戳
 
 // ============================================================================
-// PIO 程式 — 四倍頻編碼器解碼
+// PIO 程式 — 四倍頻編碼器解碼（僅顯示用，不參與控制）
 // ============================================================================
 static const uint16_t pio_encoder_instructions[] = {
     0x2020, // 0: wait 0 pin, 0
@@ -199,8 +113,6 @@ static const pio_program_t pio_encoder_program = {
 // ============================================================================
 static void onMoveCommand(const ChassisSnapshot& cmd);
 static void onMoveEstop();
-static void readEncoders(float dt);
-static void wheelSetPwm(uint pwmPin, uint dirPin, float value);
 
 // ============================================================================
 // SlaveApp 回呼實作 — 由 SlaveComms 在 Core 1 中呼叫
@@ -214,120 +126,93 @@ static SlaveApp moveApp = {
 static SlaveComms slave(&moveApp);
 
 // ============================================================================
-// 運動控制狀態（Core 1 專用）
+// 命令除錯快照 — Core 1 寫入，Core 0 印出（遵循專案規範）
 // ============================================================================
-static RampedTarget rampVx(Kinematics::ACCEL_LIMIT);
-static RampedTarget rampVy(Kinematics::ACCEL_LIMIT);
-static RampedTarget rampOmega(Kinematics::ACCEL_LIMIT);
-static bool         rampInitialized = false;
-static bool         prevEstop       = false;
-static uint64_t     lastTickUs      = 0;
-static uint8_t      tmFrameSeq      = 0;  // 遙測幀序號
+static volatile float dbg_vx    = 0.0f;
+static volatile float dbg_vy    = 0.0f;
+static volatile float dbg_omega = 0.0f;
+static volatile bool  dbg_estop = false;
+static volatile uint32_t dbg_cmdCount = 0; // Core 1 實際執行 onCommand 的次數
 
 // ============================================================================
-// wheelSetPwm — 設定一輪的 PWM duty + DIR 方向
-//
-// value > 0 → forward (DIR=1), value < 0 → reverse (DIR=0)
-// PWM duty 根據 PID_OUT_LIMIT 按比例映射至 MOTOR_MAX_DUTY
+// 硬體 PWM 輸出 + DIR（對齊 motor.h 行為）
+//   - duty>=0 → DIR=LOW(正轉)；duty<0 → DIR=HIGH(反轉)，輸出 |duty|
+//   - 輸入為 duty%（-100~100）；極性已在呼叫端乘以 kWheelPolarity[]
 // ============================================================================
-static void wheelSetPwm(uint pwmPin, uint dirPin, float value) {
-    gpio_put(dirPin, (value >= 0.0f) ? 1 : 0);
-    float absVal = fabsf(value);
-    uint16_t duty = (absVal > RobotConfig::PID_OUT_LIMIT) ? RobotConfig::MOTOR_MAX_DUTY
-        : static_cast<uint16_t>(absVal / RobotConfig::PID_OUT_LIMIT * RobotConfig::MOTOR_MAX_DUTY);
-    pwm_set_gpio_level(pwmPin, duty);
+static void wheelSetPwm(uint pwmPin, uint dirPin, float dutyPercent) {
+    bool fwd = (dutyPercent >= 0.0f);
+    gpio_put(dirPin, fwd ? 0 : 1);   // LOW=正轉, HIGH=反轉
+    float a = fabsf(dutyPercent);
+    if (a > 100.0f) a = 100.0f;
+    uint16_t level = static_cast<uint16_t>(a / 100.0f * MoveCfg::PWM_WRAP);
+    pwm_set_gpio_level(pwmPin, level);
+}
+
+static void initWheelPwm(uint gpio) {
+    gpio_set_function(gpio, GPIO_FUNC_PWM);
+    uint slice = pwm_gpio_to_slice_num(gpio);
+    pwm_config cfg = pwm_get_default_config();
+    // 對齊 motor.h：clkdiv=6.25, wrap=1000 → ~20kHz，避免 50Hz 低頻震動
+    pwm_config_set_clkdiv(&cfg, 6.25f);      // 125MHz / (1000+1) / 6.25 ≈ 20kHz
+    pwm_config_set_clkdiv_mode(&cfg, PWM_DIV_FREE_RUNNING);
+    pwm_config_set_wrap(&cfg, MoveCfg::PWM_WRAP);   // 1000
+    pwm_init(slice, &cfg, false);
+    pwm_set_gpio_level(gpio, 0);
+    pwm_set_enabled(slice, true);
 }
 
 // ============================================================================
-// onMoveCommand — Core 1 收到命令時執行一次控制週期
+// onMoveCommand — Core 1 收到命令時執行一次開迴路控制週期
 // ============================================================================
 static void onMoveCommand(const ChassisSnapshot& cmd) {
-    if (!rampInitialized) {
-        rampVx.reset();
-        rampVy.reset();
-        rampOmega.reset();
-        lastTickUs = time_us_64();
-        rampInitialized = true;
-    }
+    // 記錄收到的命令供 Core 0 印出（實際控制測試用）
+    dbg_cmdCount++;
+    dbg_vx    = cmd.vx;
+    dbg_vy    = cmd.vy;
+    dbg_omega = cmd.omega;
+    dbg_estop = false;
 
-    // E-Stop falling edge：復原瞬間重置 ramper
-    if (prevEstop) {
-        prevEstop = false;
-        rampVx.reset();
-        rampVy.reset();
-        rampOmega.reset();
-        lastTickUs = time_us_64();
-    }
+    // 車身速度 (RPS) → 各輪目標線速度 (m/s)
+    //   輪線速度 = 輪轉速(rad/s) × 輪半徑
+    //   wx 帶負號：校正前後(vx)方向（只影響前後，不影響左右/旋轉）
+    float wx = -cmd.vx * TWO_PI;   // rad/s (vx 方向校正)
+    float wy =  cmd.vy * TWO_PI;   // rad/s
+    float K  = MoveCfg::HALF_LENGTH + MoveCfg::HALF_WIDTH;
 
-    // 計算 dt
-    uint64_t now = time_us_64();
-    float dt = static_cast<float>(now - lastTickUs) * 1e-6f;
-    if (dt < 1e-6f) dt = 1e-6f;
-    if (dt > 5e-3f) dt = 5e-3f;
-    lastTickUs = now;
+    // 麥克納姆「標準正向」公式（輪線速度，m/s）— 對齊你貼的 kinToWheel
+    //   座標系：x=車頭+，y=車右+，ω 逆時針=+
+    //   FL = vx - vy - K·ω ; FR = vx + vy + K·ω
+    //   BL = vx + vy - K·ω ; BR = vx - vy + K·ω
+    //   方向差異（實際接線）一律用 kWheelPolarity[] 校正，不改運動學公式
+    float lin[4];
+    lin[0] = (wx - wy - K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // FL
+    lin[1] = (wx + wy + K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // FR
+    lin[2] = (wx + wy - K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // BL
+    lin[3] = (wx - wy + K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // BR
 
-    // 車身速度 ramping
-    float rampedVx   = rampVx.update(cmd.vx, dt);
-    float rampedVy   = rampVy.update(cmd.vy, dt);
-    float rampedOmega = rampOmega.update(cmd.omega, dt);
-
-    // Mecanum 運動學解算
-    float flTarget, frTarget, rlTarget, rrTarget;
-    Kinematics::computeWheelTargets(rampedVx, rampedVy, rampedOmega,
-                                    flTarget, frTarget, rlTarget, rrTarget);
-
-    // 讀取編碼器
-    readEncoders(dt);
-
-    // PID + Feedforward
-    float pwmFL = wheels[0].pid.update(flTarget, wheels[0].currentRps, dt);
-    float pwmFR = wheels[1].pid.update(frTarget, wheels[1].currentRps, dt);
-    float pwmRL = wheels[2].pid.update(rlTarget, wheels[2].currentRps, dt);
-    float pwmRR = wheels[3].pid.update(rrTarget, wheels[3].currentRps, dt);
-
-    // NaN 安全檢查
-    if (std::isnan(pwmFL) || std::isinf(pwmFL) ||
-        std::isnan(pwmFR) || std::isinf(pwmFR) ||
-        std::isnan(pwmRL) || std::isinf(pwmRL) ||
-        std::isnan(pwmRR) || std::isinf(pwmRR)) {
-        onMoveEstop();
-        return;
-    }
-
-    // 寫入硬體 PWM+DIR
-    wheelSetPwm(wheels[0].pwmPin, wheels[0].dirPin, pwmFL);
-    wheelSetPwm(wheels[1].pwmPin, wheels[1].dirPin, pwmFR);
-    wheelSetPwm(wheels[2].pwmPin, wheels[2].dirPin, pwmRL);
-    wheelSetPwm(wheels[3].pwmPin, wheels[3].dirPin, pwmRR);
-
-    // 更新狀態
-    wheels[0].targetRps = flTarget; wheels[0].pwmOutput = pwmFL;
-    wheels[1].targetRps = frTarget; wheels[1].pwmOutput = pwmFR;
-    wheels[2].targetRps = rlTarget; wheels[2].pwmOutput = pwmRL;
-    wheels[3].targetRps = rrTarget; wheels[3].pwmOutput = pwmRR;
-
-    // 構建遙測封包，交由 Core 0 定時發送
-    MoveTelemetry tm = {};
-    tm.sync       = 0xA5;
-    tm.msgType    = MsgType::TELEMETRY;
-    tm.frameSeq   = tmFrameSeq++;
-    tm.targetID   = TargetID::HUB;
+    // 線速度 → 目標 duty%
     for (int i = 0; i < 4; i++) {
-        tm.currentRps[i] = wheels[i].currentRps;
-        tm.targetRps[i]  = wheels[i].targetRps;
-        tm.pwmOutput[i]  = wheels[i].pwmOutput;
+        float duty = lin[i] * MoveCfg::DUTY_PER_MPS;
+        if (duty > 100.0f) duty = 100.0f;
+        if (duty < -100.0f) duty = -100.0f;
+        wheels[i].targetDuty = duty;
     }
-    tm.cmdVx    = cmd.vx;
-    tm.cmdVy    = cmd.vy;
-    tm.cmdOmega = cmd.omega;
-    tm.mode     = RobotMode::AUTO;
-    tm.estopFlag = 0;
-    tm.timestamp = time_us_64();
-    tm.crc16 = 0;
-    tm.crc16 = SignalUtils::calculateCrc(
-                   reinterpret_cast<const uint8_t*>(&tm),
-                   sizeof(MoveTelemetry) - 2);
-    slave.prepareTelemetry(tm);
+
+    // 開迴路 slope 逼近 + 寫入 PWM（每次控制幀執行）
+    uint64_t nowUs = time_us_64();
+    float dt = static_cast<float>(nowUs - lastTickUs) * 1e-6f;
+    if (dt < 1e-4f) dt = 1e-4f;
+    if (dt > 0.05f) dt = 0.05f;
+    lastTickUs = nowUs;
+    float maxStep = MoveCfg::RAMP_RATE_PERCENT_PER_SEC * dt;
+    for (int i = 0; i < 4; i++) {
+        float d = wheels[i].targetDuty - wheels[i].outDuty;
+        if (d > maxStep) d = maxStep;
+        if (d < -maxStep) d = -maxStep;
+        wheels[i].outDuty += d;
+        wheelSetPwm(wheels[i].pwmPin, wheels[i].dirPin,
+                    wheels[i].outDuty * kWheelPolarity[i]);
+    }
 }
 
 // ============================================================================
@@ -335,212 +220,95 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
 // ============================================================================
 static void onMoveEstop() {
     for (int i = 0; i < 4; i++) {
-        pwm_set_gpio_level(wheels[i].pwmPin, 0);
-        wheels[i].pid.reset();
-        wheels[i].currentRps = 0.0f;
-        wheels[i].targetRps = 0.0f;
-        wheels[i].pwmOutput = 0.0f;
+        wheels[i].targetDuty = 0.0f;
+        wheels[i].outDuty    = 0.0f;
+        wheelSetPwm(wheels[i].pwmPin, wheels[i].dirPin, 0.0f);
     }
-    rampVx.reset();
-    rampVy.reset();
-    rampOmega.reset();
-    prevEstop = true;
-}
-
-// ============================================================================
-// 讀取編碼器並計算各輪當前轉速
-// ============================================================================
-static void readEncoders(float dt) {
-    constexpr float ENC_COUNTS_PER_REV = 4.0f * 1200.0f;
-    constexpr float INV_ENC = 1.0f / ENC_COUNTS_PER_REV;
-    static int32_t prevCount[4] = {0, 0, 0, 0};
-
-    for (int i = 0; i < 4; i++) {
-        int32_t raw = wheels[i].encoderCount;
-        int32_t delta = raw - prevCount[i];
-        prevCount[i] = raw;
-        wheels[i].currentRps = static_cast<float>(delta) * INV_ENC / dt;
-    }
-}
-
-// ============================================================================
-// BMI270 IMU 驅動
-// ============================================================================
-namespace Bmi270 {
-    static i2c_inst_t* i2c = i2c0;
-
-    constexpr uint8_t ADDR = 0x68;         // BMI270 I2C address (ADDR=0)
-    constexpr uint8_t REG_CHIP_ID  = 0x00;
-    constexpr uint8_t REG_PWR_CONF = 0x7C;
-    constexpr uint8_t REG_INIT_CTRL = 0x59;
-    constexpr uint8_t REG_ACC_CONF = 0x40;
-    constexpr uint8_t REG_GYR_CONF = 0x42;
-    constexpr uint8_t REG_ACC_DATA = 0x12;  // 6 bytes: X_L, X_H, Y_L, Y_H, Z_L, Z_H
-    constexpr uint8_t REG_GYR_DATA = 0x18;  // 6 bytes
-
-    struct ImuData {
-        int16_t accX, accY, accZ;
-        int16_t gyrX, gyrY, gyrZ;
-        bool valid;
-    };
-
-    static bool initialized = false;
-
-    static uint8_t readReg(uint8_t reg) {
-        uint8_t val;
-        i2c_write_blocking(i2c, ADDR, &reg, 1, true);
-        i2c_read_blocking(i2c, ADDR, &val, 1, false);
-        return val;
-    }
-
-    static void writeReg(uint8_t reg, uint8_t val) {
-        const uint8_t buf[2] = {reg, val};
-        i2c_write_blocking(i2c, ADDR, buf, 2, false);
-    }
-
-    bool init() {
-        i2c_init(i2c, 400000);
-        gpio_set_function(Pin::IMU_SDA, GPIO_FUNC_I2C);
-        gpio_set_function(Pin::IMU_SCL, GPIO_FUNC_I2C);
-        gpio_pull_up(Pin::IMU_SDA);
-        gpio_pull_up(Pin::IMU_SCL);
-
-        uint8_t chipId = readReg(REG_CHIP_ID);
-        if (chipId != 0x24) {  // BMI270 chip ID
-            initialized = false;
-            return false;
-        }
-
-        // Power on
-        writeReg(REG_PWR_CONF, 0x00);
-        busy_wait_us(1000);
-
-        // Accel: ±2g, normal mode, 100Hz ODR
-        writeReg(REG_ACC_CONF, 0x0A);
-
-        // Gyro: ±2000dps, normal mode, 100Hz ODR
-        writeReg(REG_GYR_CONF, 0x0A);
-
-        initialized = true;
-        return true;
-    }
-
-    ImuData read() {
-        ImuData data = {0, 0, 0, 0, 0, 0, false};
-        if (!initialized) return data;
-
-        uint8_t reg = REG_ACC_DATA;
-        uint8_t buf[12];
-        i2c_write_blocking(i2c, ADDR, &reg, 1, true);
-        i2c_read_blocking(i2c, ADDR, buf, 12, false);
-
-        data.accX = static_cast<int16_t>(buf[0] | (buf[1] << 8));
-        data.accY = static_cast<int16_t>(buf[2] | (buf[3] << 8));
-        data.accZ = static_cast<int16_t>(buf[4] | (buf[5] << 8));
-        data.gyrX = static_cast<int16_t>(buf[6] | (buf[7] << 8));
-        data.gyrY = static_cast<int16_t>(buf[8] | (buf[9] << 8));
-        data.gyrZ = static_cast<int16_t>(buf[10] | (buf[11] << 8));
-        data.valid = true;
-        return data;
-    }
-} // namespace Bmi270
-
-// ============================================================================
-// 硬體 PWM 初始化輔助 — 為特定 GPIO 設定 PWM 參數
-// ============================================================================
-static void initHardwarePwm(uint gpio) {
-    gpio_set_function(gpio, GPIO_FUNC_PWM);
-    uint slice = pwm_gpio_to_slice_num(gpio);
-
-    pwm_config cfg = pwm_get_default_config();
-    // 設定 clkdiv 與 wrap 以獲得約 25kHz PWM
-    // System clock 150MHz, wrap=40000, div=150
-    // PWM freq = 150e6 / (150 * 40000) ≈ 25kHz
-    pwm_config_set_clkdiv(&cfg, 150.0f);
-    pwm_config_set_wrap(&cfg, RobotConfig::MOTOR_MAX_DUTY);
-    pwm_init(slice, &cfg, false);
+    dbg_estop = true;
 }
 
 // ============================================================================
 // Core 0
 // ============================================================================
 void setup() {
+    // ---- 本機除錯輸出 (USB CDC) ----
+    Serial.begin(115200);
+    delay(200);
+    Serial.println("[MOVE] 開迴路 PWM 啟動（等待 Hub 命令）");
+
     // ---- 通訊（SlaveComms 內部處理 Serial1 + ChassisComms）----
     slave.begin();
 
-    // ---- 硬體 PWM 初始化 ----'
-    // PWM pins: FL=6, FR=8, BL=10, BR=12
-    constexpr uint pwmPins[4] = {
-        Pin::MOTOR_FL_PWM, Pin::MOTOR_FR_PWM,
-        Pin::MOTOR_BL_PWM, Pin::MOTOR_BR_PWM
-    };
-    // DIR pins: FL=7, FR=9, BL=11, BR=13
-    constexpr uint dirPins[4] = {
-        Pin::MOTOR_FL_DIR, Pin::MOTOR_FR_DIR,
-        Pin::MOTOR_BL_DIR, Pin::MOTOR_BR_DIR
-    };
+    // ---- 馬達 PWM + DIR 初始化 ----
+    constexpr uint pwmPins[4] = { Pin::MOTOR_FL_PWM, Pin::MOTOR_FR_PWM,
+                                  Pin::MOTOR_BL_PWM, Pin::MOTOR_BR_PWM };
+    constexpr uint dirPins[4] = { Pin::MOTOR_FL_DIR, Pin::MOTOR_FR_DIR,
+                                  Pin::MOTOR_BL_DIR, Pin::MOTOR_BR_DIR };
+    constexpr uint encPins[4] = { Pin::MOTOR_FL_ENC, Pin::MOTOR_FR_ENC,
+                                  Pin::MOTOR_BL_ENC, Pin::MOTOR_BR_ENC };
 
     for (int i = 0; i < 4; i++) {
-        // 初始化硬體 PWM
-        initHardwarePwm(pwmPins[i]);
-        pwm_set_gpio_level(pwmPins[i], 0);
+        initWheelPwm(pwmPins[i]);
+        wheels[i].pwmPin = pwmPins[i];
+        wheels[i].dirPin = dirPins[i];
+        wheels[i].encPin = encPins[i];
+        wheels[i].targetDuty = 0.0f;
+        wheels[i].outDuty    = 0.0f;
 
-        // 初始化 DIR pin（輸出，預設正向）
+        // DIR pin (輸出，預設正向)
         gpio_init(dirPins[i]);
         gpio_set_dir(dirPins[i], GPIO_OUT);
         gpio_put(dirPins[i], 1);
-
-        // 填入 WheelState
-        wheels[i].pwmPin = pwmPins[i];
-        wheels[i].dirPin = dirPins[i];
-        wheels[i].pid.reset();
-
-        // 啟動 PWM（使能後才開始輸出）
-        pwm_set_enabled(pwm_gpio_to_slice_num(pwmPins[i]), true);
     }
 
-    // ---- PIO Encoder 初始化 (block0) ----
+    // ---- PIO 編碼器初始化（僅顯示）----
     PIO encPio = pio0;
     uint encOffset = pio_add_program(encPio, &pio_encoder_program);
     for (int i = 0; i < 4; i++) {
-        wheels[i].encSm = static_cast<uint>(i);
-
-        uint pinA, pinB;
-        switch (i) {
-            case 0: pinA = Pin::MOTOR_FL_ENC_A; pinB = Pin::MOTOR_FL_ENC_B; break;
-            case 1: pinA = Pin::MOTOR_FR_ENC_A; pinB = Pin::MOTOR_FR_ENC_B; break;
-            case 2: pinA = Pin::MOTOR_BL_ENC_A; pinB = Pin::MOTOR_BL_ENC_B; break;
-            case 3: pinA = Pin::MOTOR_BR_ENC_A; pinB = Pin::MOTOR_BR_ENC_B; break;
-            default: pinA = 0; pinB = 0; break;
-        }
-
+        uint pinA = encPins[i];
+        uint pinB = encPins[i] + 1;
         pio_gpio_init(encPio, pinA); pio_gpio_init(encPio, pinB);
         gpio_set_function(pinA, GPIO_FUNC_PIO0);
         gpio_set_function(pinB, GPIO_FUNC_PIO0);
 
-        pio_sm_config encCfg = pio_get_default_sm_config();
-        sm_config_set_wrap(&encCfg, encOffset, encOffset + pio_encoder_program.length - 1);
-        sm_config_set_in_pins(&encCfg, pinA);
-        sm_config_set_jmp_pin(&encCfg, pinA);
-        sm_config_set_in_pin_count(&encCfg, 2);
-        sm_config_set_clkdiv(&encCfg, 1.0f);
-
-        pio_sm_init(encPio, i, encOffset, &encCfg);
+        pio_sm_config c = pio_get_default_sm_config();
+        sm_config_set_wrap(&c, encOffset, encOffset + pio_encoder_program.length - 1);
+        sm_config_set_in_pins(&c, pinA);
+        sm_config_set_jmp_pin(&c, pinA);
+        sm_config_set_in_pin_count(&c, 2);
+        sm_config_set_clkdiv(&c, 1.0f);
+        pio_sm_init(encPio, i, encOffset, &c);
         pio_sm_set_enabled(encPio, i, true);
-    }
-
-    // ---- BMI270 IMU 初始化 ----
-    if (Bmi270::init()) {
-        // IMU 初始化成功（可透過 SlaveComms 記錄或忽略）
     }
 }
 
 void loop() {
     slave.update();
+
+    // 每 100ms 印一次收到的命令與實際輸出（Core 0，safe 用 Serial）
+    static uint32_t lastPrint = 0;
+    uint32_t nowCfg = millis();
+    if (nowCfg - lastPrint >= 100) {
+        lastPrint = nowCfg;
+        // 診斷資訊：距上次有效命令 ms、有效命令總數、Core1 onCmd 次數
+        uint32_t since = slave.msSinceLastValidCmd();
+        uint32_t cnt   = slave.validCmdCount();
+        Serial.printf("[MOVE] sinceCmd=%ums cnt=%u onCmd=%u\n",
+                      since, cnt, dbg_cmdCount);
+        if (dbg_estop) {
+            Serial.println("[MOVE] ** E-STOP active **");
+        } else {
+            Serial.printf("[MOVE] vx=%+.2f vy=%+.2f omega=%+.2f | "
+                          "duty=%+.0f,%+.0f,%+.0f,%+.0f%%\n",
+                          dbg_vx, dbg_vy, dbg_omega,
+                          wheels[0].outDuty, wheels[1].outDuty,
+                          wheels[2].outDuty, wheels[3].outDuty);
+        }
+    }
 }
 
 // ============================================================================
-// Core 1 — 自旋等待 SlaveComms 派發命令，執行運動控制
+// Core 1 — 自旋等待 SlaveComms 派發命令，執行開迴路 PWM 控制
 // ============================================================================
 void setup1() {
     // 無需額外初始化

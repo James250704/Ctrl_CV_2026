@@ -186,6 +186,15 @@ public:
         return estopActive_.load(std::memory_order_acquire);
     }
 
+    /// 距上次收到有效控制幀的時間 (ms)。逾時保護用之除錯：若持續增大，
+    /// 表示 UART0 沒收到 Hub 有效幀（接線/波特率/COBS 問題）。
+    uint32_t msSinceLastValidCmd() const {
+        return static_cast<uint32_t>((time_us_64() - lastValidCmdTime_) / 1000ULL);
+    }
+
+    /// 收到有效控制幀的總次數（除錯用）
+    uint32_t validCmdCount() const { return validCmdCount_; }
+
     /// 取得 ChassisComms 參考（用於自訂收發）
     ChassisComms& comms() { return hubComms_; }
 
@@ -234,8 +243,9 @@ private:
         if (pkt.targetID != app_->targetID && pkt.targetID != TargetID::BROADCAST)
             return;
 
-        // 更新最後有效幀時間（逾時保護用）
+        // 更新最後有效幀時間（逾時保護用）+ 計數
         lastValidCmdTime_ = time_us_64();
+        validCmdCount_++;
 
         // 根據 targetID 解碼不同的 payload
         constexpr float SCALE = RobotConfig::MAX_RPS / 127.0f;
@@ -283,6 +293,7 @@ private:
     static inline std::atomic<bool> cmdValid_{false};
     static inline std::atomic<bool> estopActive_{false};
     static inline uint64_t lastValidCmdTime_ = 0;
+    static inline uint32_t validCmdCount_ = 0;
 
     // 遙測：Core 1 寫入 → Core 0 發送（單緩衝 + atomic flag）
     static constexpr uint64_t TELEMETRY_INTERVAL_US = 50000ULL;  // 50ms = 20Hz

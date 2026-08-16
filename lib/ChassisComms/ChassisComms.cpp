@@ -63,11 +63,12 @@ bool ChassisComms::sendTelemetry(const MoveTelemetry& telemetry) {
 
     size_t totalBytes = cobsLen + 1;
 
-    if (stream->availableForWrite() >= static_cast<int>(totalBytes)) {
-        size_t written = stream->write(cobsBuf, totalBytes);
-        return written == totalBytes;
+    // 同 sendPacket：檢查至少 1 byte 空間即可嘗試送整包（SerialPIO FIFO 僅 8）
+    if (stream == nullptr || stream->availableForWrite() <= 0) {
+        return false;
     }
-    return false;
+    size_t written = stream->write(cobsBuf, totalBytes);
+    return written == totalBytes;
 }
 
 bool ChassisComms::sendPacket(const ControlPacket& pkt) {
@@ -82,12 +83,16 @@ bool ChassisComms::sendPacket(const ControlPacket& pkt) {
 
     size_t totalBytes = cobsLen + 1;
 
-    // 非阻塞寫入：檢查 TX 剩餘空間 (CLAUDE.md §發送規則)
-    if (stream->availableForWrite() >= static_cast<int>(totalBytes)) {
-        size_t written = stream->write(cobsBuf, totalBytes);
-        return written == totalBytes;
+    // 非阻塞寫入：只要有餘裕寫入至少 1 byte 即嘗試送整包。
+    // (註) 不能檢查 availableForWrite() >= totalBytes：
+    //   SerialPIO 的 TX FIFO 僅 8 bytes，遠小於一包 (~22 bytes)，
+    //   若要求整包空間會永遠失敗而靜默丟棄 → PIO 鏈路完全不通。
+    //   SerialPIO::write() 內部為 pio_sm_put_blocking，會自行等 FIFO 空間。
+    if (stream == nullptr || stream->availableForWrite() <= 0) {
+        return false; // 完全無緩衝空間 → 丟棄
     }
-    return false; // TX 滿 → 靜默丟棄
+    size_t written = stream->write(cobsBuf, totalBytes);
+    return written == totalBytes;
 }
 
 void ChassisComms::update() {

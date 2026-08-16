@@ -37,21 +37,21 @@
 //   PIO SM1 ← Shoot slave (GP5 RX)       — 接收 Shoot 遙測 COBS 幀
 //   PIO SM2 → Storage slave (GP6 TX)     — ChassisComms 綁定 storageUart
 //   PIO SM2 ← Storage slave (GP7 RX)     — 接收 Storage 遙測 COBS 幀
-//   UART1  → 除錯 (GP4 TX, GP5 RX)       — CLAUDE.md §UART 腳位, 115200 baud
 // 注意：GP4/GP5 在 UART1 除錯與 PIO SM1 (Shoot) 之間衝突，須在硬體層面確保
 //       不會同時啟用。當前預設 PIO SM1 優先於 UART1。
 // ============================================================================
+
 #include "ChassisComms.h"
-#include <CrsfReceiver.h>
 #include <Arduino.h>
+#include <CrsfReceiver.h>
 #include <SerialPIO.h>
 
 // ============================================================================
 // 跨核心共用變數 — Core 1 寫入，Core 0 讀取
 // RP2350 SCU 保證 cache coherency，volatile 防止編譯器過度優化
 // ============================================================================
-static volatile int16_t  rc_channels[10]; // -100 ~ 100，由 Core 1 更新
-static volatile bool     rc_failsafe;     // true = 遙控器斷線
+static volatile int16_t rc_channels[10]; // -100 ~ 100，由 Core 1 更新
+static volatile bool rc_failsafe;        // true = 遙控器斷線
 
 // ============================================================================
 // PIO UART 硬體分配 (Hub 端)
@@ -65,19 +65,20 @@ static volatile bool     rc_failsafe;     // true = 遙控器斷線
 // 交叉連接：Hub PIO TX → Slave UART0 RX(GP1)，Slave UART0 TX(GP0) → Hub PIO RX
 //   Move：    Hub SM0 TX(GP2) → Move RX(GP1)， Move TX(GP0) → Hub SM0 RX(GP3)
 //   Shoot：   Hub SM1 TX(GP4) → Shoot RX(GP1)， Shoot TX(GP0) → Hub SM1 RX(GP5)
-//   Storage： Hub SM2 TX(GP6) → Storage RX(GP1)， Storage TX(GP0) → Hub SM2 RX(GP7)
+//   Storage： Hub SM2 TX(GP6) → Storage RX(GP1)， Storage TX(GP0) → Hub SM2
+//   RX(GP7)
 // ============================================================================
-static constexpr uint8_t PIN_MOVE_TX    = 2;
-static constexpr uint8_t PIN_MOVE_RX    = 3;
-static constexpr uint8_t PIN_SHOOT_TX   = 4;
-static constexpr uint8_t PIN_SHOOT_RX   = 5;
+static constexpr uint8_t PIN_MOVE_TX = 2;
+static constexpr uint8_t PIN_MOVE_RX = 3;
+static constexpr uint8_t PIN_SHOOT_TX = 4;
+static constexpr uint8_t PIN_SHOOT_RX = 5;
 static constexpr uint8_t PIN_STORAGE_TX = 6;
 static constexpr uint8_t PIN_STORAGE_RX = 7;
 
 // earlephilhower SerialPIO：每個 slave 一個實例，各自使用獨立的 PIO SM。
 // SerialPIO(txPin, rxPin, fifoSize)
-static SerialPIO moveUart(PIN_MOVE_TX, PIN_MOVE_RX);       // TX=GP2, RX=GP3
-static SerialPIO shootUart(PIN_SHOOT_TX, PIN_SHOOT_RX);    // TX=GP4, RX=GP5
+static SerialPIO moveUart(PIN_MOVE_TX, PIN_MOVE_RX);          // TX=GP2, RX=GP3
+static SerialPIO shootUart(PIN_SHOOT_TX, PIN_SHOOT_RX);       // TX=GP4, RX=GP5
 static SerialPIO storageUart(PIN_STORAGE_TX, PIN_STORAGE_RX); // TX=GP6, RX=GP7
 
 // ============================================================================
@@ -99,46 +100,47 @@ static PioRxBuffer storageRxBuf;
 // 遙測資料儲存 — Hub 解析 Slave 回傳的 MoveTelemetry 後存入此處
 // 供 Core 0 主迴圈或其他模組讀取。
 // ============================================================================
-static MoveTelemetry latestMoveTm    = {};
-static MoveTelemetry latestShootTm   = {};
+static MoveTelemetry latestMoveTm = {};
+static MoveTelemetry latestShootTm = {};
 static MoveTelemetry latestStorageTm = {};
-static uint64_t lastMoveTmUs    = 0;  // 0 = 從未收到
-static uint64_t lastShootTmUs   = 0;
+static uint64_t lastMoveTmUs = 0; // 0 = 從未收到
+static uint64_t lastShootTmUs = 0;
 static uint64_t lastStorageTmUs = 0;
 
 // ============================================================================
 // Slave 當機偵測逾時時間
 // 收到首次遙測後，若超過此時間無新遙測 → 發送 REBOOT 訊息。
 // ============================================================================
-static constexpr uint64_t SLAVE_TELEMETRY_TIMEOUT_US = 500000ULL;  // 500ms
+static constexpr uint64_t SLAVE_TELEMETRY_TIMEOUT_US = 500000ULL; // 500ms
 
 // ============================================================================
 // 輔助函式：COBS 解碼（inline，從原始 COBS 位元組流解碼）
 // 回傳解碼後的位元組數，失敗回傳 0。
 // ============================================================================
-static size_t cobsDecodeInline(const uint8_t* src, size_t len, uint8_t* dst, size_t dstSize) {
-    size_t readIdx  = 0;
+static size_t cobsDecodeInline(const uint8_t* src, size_t len, uint8_t* dst,
+                               size_t dstSize) {
+    size_t readIdx = 0;
     size_t writeIdx = 0;
 
-    while (readIdx < len) {
+    while(readIdx < len) {
         uint8_t code = src[readIdx];
-        size_t  blockLen = static_cast<size_t>(code);
+        size_t blockLen = static_cast<size_t>(code);
 
         // 來源位元組不足
-        if (readIdx + blockLen > len)
+        if(readIdx + blockLen > len)
             return 0;
         readIdx++;
 
         // 目的溢位
-        if (writeIdx + (blockLen - 1) > dstSize)
+        if(writeIdx + (blockLen - 1) > dstSize)
             return 0;
 
-        for (uint8_t i = 1; i < code; i++)
+        for(uint8_t i = 1; i < code; i++)
             dst[writeIdx++] = src[readIdx++];
 
         // 插入隱含的零值（非最後區塊）
-        if (code < 0xFF && readIdx < len) {
-            if (writeIdx >= dstSize)
+        if(code < 0xFF && readIdx < len) {
+            if(writeIdx >= dstSize)
                 return 0;
             dst[writeIdx++] = 0x00;
         }
@@ -156,21 +158,21 @@ static size_t cobsDecodeInline(const uint8_t* src, size_t len, uint8_t* dst, siz
 // ============================================================================
 static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
                          MoveTelemetry& telemetryOut, uint64_t& lastTmUs) {
-    while (uart.available() > 0) {
+    while(uart.available() > 0) {
         uint8_t byte = static_cast<uint8_t>(uart.read());
 
-        if (byte == 0x00) {
-            if (rxBuf.len == 0) {
+        if(byte == 0x00) {
+            if(rxBuf.len == 0) {
                 // 空幀或遺漏前一個終止符，跳過
                 continue;
             }
 
             // COBS 解碼
             uint8_t decoded[512];
-            size_t decodedLen = cobsDecodeInline(rxBuf.buf, rxBuf.len,
-                                                decoded, sizeof(decoded));
+            size_t decodedLen = cobsDecodeInline(rxBuf.buf, rxBuf.len, decoded,
+                                                 sizeof(decoded));
 
-            if (decodedLen == 0) {
+            if(decodedLen == 0) {
                 Serial.printf("[PIO RX][%s] COBS decode fail: bufLen=%u\n",
                               name, rxBuf.len);
                 rxBuf.len = 0;
@@ -178,49 +180,60 @@ static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
             }
 
             // CRC 驗證
-            if (decodedLen < 8) {  // 最小: sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
-                Serial.printf("[PIO RX][%s] too short: %zu bytes\n", name, decodedLen);
+            if(decodedLen <
+               8) { // 最小:
+                    // sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
+                Serial.printf("[PIO RX][%s] too short: %zu bytes\n", name,
+                              decodedLen);
                 rxBuf.len = 0;
                 continue;
             }
 
-            uint16_t storedCrc = static_cast<uint16_t>(decoded[decodedLen - 2])
-                               | (static_cast<uint16_t>(decoded[decodedLen - 1]) << 8);
-            uint16_t calcCrc = SignalUtils::calculateCrc(decoded, decodedLen - 2);
+            uint16_t storedCrc =
+                static_cast<uint16_t>(decoded[decodedLen - 2]) |
+                (static_cast<uint16_t>(decoded[decodedLen - 1]) << 8);
+            uint16_t calcCrc =
+                SignalUtils::calculateCrc(decoded, decodedLen - 2);
 
-            if (calcCrc != storedCrc) {
-                Serial.printf("[PIO RX][%s] CRC mismatch (calc=0x%04X, stored=0x%04X)\n",
-                              name, calcCrc, storedCrc);
+            if(calcCrc != storedCrc) {
+                Serial.printf(
+                    "[PIO RX][%s] CRC mismatch (calc=0x%04X, stored=0x%04X)\n",
+                    name, calcCrc, storedCrc);
                 rxBuf.len = 0;
                 continue;
             }
 
             // CRC 通過 — 依大小分發
-            if (decodedLen == sizeof(MoveTelemetry)) {
+            if(decodedLen == sizeof(MoveTelemetry)) {
                 // 遙測封包 (72 bytes)
                 memcpy(&telemetryOut, decoded, sizeof(MoveTelemetry));
                 lastTmUs = time_us_64();
-                Serial.printf("[PIO RX][%s] telemetry OK: frameSeq=%d, timestamp=%lu\n",
-                              name, telemetryOut.frameSeq,
-                              static_cast<unsigned long>(telemetryOut.timestamp));
-            } else if (decodedLen >= sizeof(ControlPacket)) {
+                Serial.printf(
+                    "[PIO RX][%s] telemetry OK: frameSeq=%d, timestamp=%lu\n",
+                    name, telemetryOut.frameSeq,
+                    static_cast<unsigned long>(telemetryOut.timestamp));
+            } else if(decodedLen >= sizeof(ControlPacket)) {
                 // 控制/心跳/E-Stop 封包 (20 bytes)
-                const ControlPacket& pkt = *reinterpret_cast<const ControlPacket*>(decoded);
-                Serial.printf("[PIO RX][%s] pkt: msgType=%d, frameSeq=%d, targetID=%d\n",
-                              name, pkt.msgType, pkt.frameSeq, pkt.targetID);
+                const ControlPacket& pkt =
+                    *reinterpret_cast<const ControlPacket*>(decoded);
+                Serial.printf(
+                    "[PIO RX][%s] pkt: msgType=%d, frameSeq=%d, targetID=%d\n",
+                    name, pkt.msgType, pkt.frameSeq, pkt.targetID);
             } else {
-                Serial.printf("[PIO RX][%s] unknown frame: %zu bytes\n", name, decodedLen);
+                Serial.printf("[PIO RX][%s] unknown frame: %zu bytes\n", name,
+                              decodedLen);
             }
 
             rxBuf.len = 0; // 重置緩衝區
         } else {
             // 一般位元組：寫入緩衝區
-            if (rxBuf.len < PIO_RX_BUF_SIZE) {
+            if(rxBuf.len < PIO_RX_BUF_SIZE) {
                 rxBuf.buf[rxBuf.len++] = byte;
             } else {
                 // 緩衝區溢出：丟棄並重置
                 rxBuf.len = 0;
-                Serial.printf("[PIO RX][%s] buffer overflow, resetting\n", name);
+                Serial.printf("[PIO RX][%s] buffer overflow, resetting\n",
+                              name);
             }
         }
     }
@@ -236,9 +249,9 @@ static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
 // hbIntervalUs=0 停用心跳 — 因為 Hub→Slaves 方向為主機發送控制幀，
 // 不需要定期心跳（Slave 端已有指令逾時 100ms E-Stop 保護）。
 // ============================================================================
-static ChassisComms jetsonComms(&Serial, TargetID::HUB);
-static ChassisComms moveComms(&moveUart, TargetID::MOVE,    0);
-static ChassisComms shootComms(&shootUart, TargetID::SHOOT,  0);
+static ChassisComms jetsonComms(&Serial, TargetID::HUB, 0); // 無心跳（測試未接 Jetson）
+static ChassisComms moveComms(&moveUart, TargetID::MOVE, 0);
+static ChassisComms shootComms(&shootUart, TargetID::SHOOT, 0);
 static ChassisComms storageComms(&storageUart, TargetID::STORAGE, 0);
 
 // ============================================================================
@@ -250,15 +263,14 @@ static ChassisComms storageComms(&storageUart, TargetID::STORAGE, 0);
 // ============================================================================
 static void sendReboot(ChassisComms& comms, uint8_t targetID) {
     ControlPacket reboot = {};
-    reboot.sync       = 0xA5;
-    reboot.msgType    = MsgType::REBOOT;
-    reboot.frameSeq   = 0;
-    reboot.targetID   = targetID;
+    reboot.sync = 0xA5;
+    reboot.msgType = MsgType::REBOOT;
+    reboot.frameSeq = 0;
+    reboot.targetID = targetID;
     reboot.payloadLen = sizeof(ControlPacket) - 6 - 2;
     reboot.crc16 = 0;
     reboot.crc16 = SignalUtils::calculateCrc(
-                       reinterpret_cast<const uint8_t*>(&reboot),
-                       sizeof(ControlPacket) - 2);
+        reinterpret_cast<const uint8_t*>(&reboot), sizeof(ControlPacket) - 2);
     comms.sendPacket(reboot);
     Serial.printf("[HUB] Sent REBOOT to targetID=%d\n", targetID);
 }
@@ -267,19 +279,21 @@ static void checkSlaveTimeouts() {
     uint64_t now = time_us_64();
 
     // Move Slave
-    if (lastMoveTmUs > 0 && (now - lastMoveTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
+    if(lastMoveTmUs > 0 && (now - lastMoveTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
         sendReboot(moveComms, TargetID::MOVE);
         lastMoveTmUs = 0;
     }
 
     // Shoot Slave
-    if (lastShootTmUs > 0 && (now - lastShootTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
+    if(lastShootTmUs > 0 &&
+       (now - lastShootTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
         sendReboot(shootComms, TargetID::SHOOT);
         lastShootTmUs = 0;
     }
 
     // Storage Slave
-    if (lastStorageTmUs > 0 && (now - lastStorageTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
+    if(lastStorageTmUs > 0 &&
+       (now - lastStorageTmUs > SLAVE_TELEMETRY_TIMEOUT_US)) {
         sendReboot(storageComms, TargetID::STORAGE);
         lastStorageTmUs = 0;
     }
@@ -297,9 +311,9 @@ static CrsfReceiver crsf;
 // ============================================================================
 // Core 0 內部狀態 — Jetson 連線追蹤 & RC 備援序號
 // ============================================================================
-static uint64_t lastJetsonFrameUs = 0;  // 最後收到 Jetson 有效封包的時間
-static uint8_t  rcFallbackSeq     = 0;  // RC 備援轉發用的 frameSeq
-static uint64_t lastRcForwardUs   = 0;  // RC 備援最後轉發時間
+static uint64_t lastJetsonFrameUs = 0; // 最後收到 Jetson 有效封包的時間
+static uint8_t rcFallbackSeq = 0;      // RC 備援轉發用的 frameSeq
+static uint64_t lastRcForwardUs = 0;   // RC 備援最後轉發時間
 
 // ============================================================================
 // 轉發輔助函式：對所有 slaves 廣播一個 ControlPacket
@@ -336,16 +350,9 @@ static void forwardAllSlaves(const ControlPacket& pkt) {
 
 // 死區濾波：-10~10 → 0
 static int16_t applyDeadband(int16_t val) {
-    if (val > -10 && val < 10) return 0;
+    if(val > -10 && val < 10)
+        return 0;
     return val;
-}
-
-// 將 CH8 (-100~100) 映射到 PCA9685 通道 0~15
-static uint8_t channelToPca9685(int16_t ch) {
-    int mapped = (static_cast<int>(ch) + 100) * 15 / 200; // -100→0, 100→15
-    if (mapped < 0)  return 0;
-    if (mapped > 15) return 15;
-    return static_cast<uint8_t>(mapped);
 }
 
 // 將遙控通道值映射為 int8（含死區 + 限幅）
@@ -353,92 +360,27 @@ static int8_t rcToInt8(int16_t ch) {
     return static_cast<int8_t>(constrain(applyDeadband(ch), -100, 100));
 }
 
-// 將遙控通道值映射為 boolean（> 50 視為 true）
-static bool rcToBool(int16_t ch) {
-    return ch > 50;
-}
-
 // ============================================================================
 // RC → Move ControlPacket
 // ============================================================================
 static ControlPacket rcToMovePacket() {
     ControlPacket pkt = {};
-    pkt.sync       = 0xA5;
-    pkt.msgType    = MsgType::CONTROL;
-    pkt.frameSeq   = rcFallbackSeq++;
-    pkt.targetID   = TargetID::MOVE;
+    pkt.sync = 0xA5;
+    pkt.msgType = MsgType::CONTROL;
+    pkt.frameSeq = rcFallbackSeq++;
+    pkt.targetID = TargetID::MOVE;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    pkt.move.vx    = rcToInt8(rc_channels[0]);   // CH1 → vx
-    pkt.move.vy    = rcToInt8(rc_channels[1]);   // CH2 → vy
-    pkt.move.omega = rcToInt8(rc_channels[3]);   // CH4 → omega
+    pkt.move.vx = rcToInt8(rc_channels[1]); // CH1 → vx
+    pkt.move.vy = rcToInt8(rc_channels[0]); // CH0 → vy
+    pkt.move.omega = rcToInt8(rc_channels[7]); // CH7 → omega
 
-    // CH6 (安全開關) = -100 時強制歸零
-    if (rc_channels[5] < 0) {
-        pkt.move.vx = pkt.move.vy = pkt.move.omega = 0;
-    }
+    // (CH6 安全開關歸零暫移除 — 測試期間先讓命令直通 Move)
+    // if(rc_channels[5] < 0) { pkt.move.vx = pkt.move.vy = pkt.move.omega = 0; }
 
     pkt.crc16 = 0;
-    pkt.crc16 = SignalUtils::calculateCrc(
-                    reinterpret_cast<uint8_t*>(&pkt),
-                    sizeof(ControlPacket) - 2);
-    return pkt;
-}
-
-// ============================================================================
-// RC → Shoot ControlPacket
-// ============================================================================
-static ControlPacket rcToShootPacket() {
-    ControlPacket pkt = {};
-    pkt.sync       = 0xA5;
-    pkt.msgType    = MsgType::CONTROL;
-    pkt.frameSeq   = rcFallbackSeq++;
-    pkt.targetID   = TargetID::SHOOT;
-    pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
-
-    pkt.shoot.upSpeed   = rcToInt8(rc_channels[2]);  // CH3 → upSpeed
-    pkt.shoot.downSpeed = rcToInt8(rc_channels[4]);  // CH5 → downSpeed
-    pkt.shoot.pitch     = rcToInt8(rc_channels[6]);  // CH7 → pitch
-    pkt.shoot.row       = rcToInt8(rc_channels[7]);  // CH8 → row
-
-    // CH6 (安全開關) = -100 時強制歸零
-    if (rc_channels[5] < 0) {
-        pkt.shoot.upSpeed = pkt.shoot.downSpeed = 0;
-        pkt.shoot.pitch = pkt.shoot.row = 0;
-    }
-
-    pkt.crc16 = 0;
-    pkt.crc16 = SignalUtils::calculateCrc(
-                    reinterpret_cast<uint8_t*>(&pkt),
-                    sizeof(ControlPacket) - 2);
-    return pkt;
-}
-
-// ============================================================================
-// RC → Storage ControlPacket
-// ============================================================================
-static ControlPacket rcToStoragePacket() {
-    ControlPacket pkt = {};
-    pkt.sync       = 0xA5;
-    pkt.msgType    = MsgType::CONTROL;
-    pkt.frameSeq   = rcFallbackSeq++;
-    pkt.targetID   = TargetID::STORAGE;
-    pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
-
-    pkt.storage.motorChannel = channelToPca9685(rc_channels[8]);  // CH9 → 通道
-    pkt.storage.sw           = rcToBool(rc_channels[5]) ? 1 : 0;  // CH6 → switch
-    pkt.storage.trigger      = rcToBool(rc_channels[9]) ? 1 : 0; // CH10 → trigger
-
-    // CH6 (安全開關) = -100 時強制關閉
-    if (rc_channels[5] < 0) {
-        pkt.storage.sw = 0;
-        pkt.storage.trigger = 0;
-    }
-
-    pkt.crc16 = 0;
-    pkt.crc16 = SignalUtils::calculateCrc(
-                    reinterpret_cast<uint8_t*>(&pkt),
-                    sizeof(ControlPacket) - 2);
+    pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t*>(&pkt),
+                                          sizeof(ControlPacket) - 2);
     return pkt;
 }
 
@@ -452,22 +394,22 @@ static ControlPacket rcToStoragePacket() {
 static void onJetsonFrame(const ControlPacket& pkt) {
     lastJetsonFrameUs = time_us_64();
 
-    switch (pkt.targetID) {
-        case TargetID::MOVE:
-            moveComms.sendPacket(pkt);
-            break;
-        case TargetID::SHOOT:
-            shootComms.sendPacket(pkt);
-            break;
-        case TargetID::STORAGE:
-            storageComms.sendPacket(pkt);
-            break;
-        case TargetID::BROADCAST:
-            forwardAllSlaves(pkt);
-            break;
-        case TargetID::HUB:
-        default:
-            break;
+    switch(pkt.targetID) {
+    case TargetID::MOVE:
+        moveComms.sendPacket(pkt);
+        break;
+    case TargetID::SHOOT:
+        shootComms.sendPacket(pkt);
+        break;
+    case TargetID::STORAGE:
+        storageComms.sendPacket(pkt);
+        break;
+    case TargetID::BROADCAST:
+        forwardAllSlaves(pkt);
+        break;
+    case TargetID::HUB:
+    default:
+        break;
     }
 }
 
@@ -479,37 +421,61 @@ static void tryRcFallback() {
     uint64_t now = time_us_64();
 
     // 節流至 ~100Hz 避免 flooding
-    if (now - lastRcForwardUs < 10000ULL) // 10ms
+    if(now - lastRcForwardUs < 10000ULL) // 10ms
         return;
     lastRcForwardUs = now;
 
     // 如果遙控也斷線 → E-Stop 廣播
-    if (rc_failsafe) {
+    if(rc_failsafe) {
         ControlPacket estop = {};
-        estop.sync       = 0xA5;
-        estop.msgType    = MsgType::ESTOP;
-        estop.frameSeq   = rcFallbackSeq++;
-        estop.targetID   = TargetID::BROADCAST;
+        estop.sync = 0xA5;
+        estop.msgType = MsgType::ESTOP;
+        estop.frameSeq = rcFallbackSeq++;
+        estop.targetID = TargetID::BROADCAST;
         estop.payloadLen = sizeof(ControlPacket) - 6 - 2;
-        estop.crc16      = 0;
+        estop.crc16 = 0;
         estop.crc16 = SignalUtils::calculateCrc(
-                          reinterpret_cast<uint8_t*>(&estop),
-                          sizeof(ControlPacket) - 2);
+            reinterpret_cast<uint8_t*>(&estop), sizeof(ControlPacket) - 2);
         forwardAllSlaves(estop);
         return;
     }
 
-    // 遙控正常 → 分別轉發控制幀給三個 Slave
-    moveComms.sendPacket(rcToMovePacket());
-    shootComms.sendPacket(rcToShootPacket());
-    storageComms.sendPacket(rcToStoragePacket());
+    // 遙控正常 → 轉發控制幀給 Move
+    // （實際控制測試僅接 Move；Shoot/Storage 未接線故不轉發）
+    ControlPacket mv = rcToMovePacket();
+    bool sent = moveComms.sendPacket(mv);
+    static uint32_t sendOk = 0, sendFail = 0;
+    if(sent) sendOk++; else sendFail++;
+
+    // 除錯：直接對照「讀到的 rc_channels」與「送出的 mv.move.vx」
+    // 確認 rcToMovePacket 是否真的把 rc_channels[1] 塞進 vx
+    static uint64_t lastPktDbgUs = 0;
+    uint64_t nowPkt = time_us_64();
+    if(nowPkt - lastPktDbgUs > 1000000ULL) {
+        lastPktDbgUs = nowPkt;
+        const uint8_t* pr = reinterpret_cast<const uint8_t*>(&mv);
+        Serial.printf("[HUB] chan1=%d chan0=%d chan7=%d | mv.vx=%d mv.vy=%d "
+                      "mv.omega=%d | byte6,7,8=%02X %02X %02X\n",
+                      rc_channels[1], rc_channels[0], rc_channels[7],
+                      mv.move.vx, mv.move.vy, mv.move.omega,
+                      pr[6], pr[7], pr[8]);
+    }
+
+    // 每 1 秒印一次 send 統計 + PIO 狀態（判斷是否真的寫入 GP2）
+    static uint64_t lastSendDbgUs = 0;
+    uint64_t nowDbg = time_us_64();
+    if(nowDbg - lastSendDbgUs > 1000000ULL) {
+        lastSendDbgUs = nowDbg;
+        Serial.printf("[HUB] PIO send ok=%u fail=%u rxAvail=%d\n",
+                      sendOk, sendFail, moveUart.available());
+    }
 }
 
 // ============================================================================
 // Core 0：setup()
 // ============================================================================
 void setup() {
-    Serial.begin(921600);  // Jetson USB CDC
+    Serial.begin(921600); // Jetson USB CDC
 
     // Jetson USB CDC — ChassisCombs 綁定 &Serial, 30ms 心跳往 Jetson
     jetsonComms.begin();
@@ -524,8 +490,8 @@ void setup() {
     storageComms.begin();
 
     // 初始化接收緩衝區長度
-    moveRxBuf.len    = 0;
-    shootRxBuf.len   = 0;
+    moveRxBuf.len = 0;
+    shootRxBuf.len = 0;
     storageRxBuf.len = 0;
 
     // 初始化 Jetson 逾時追蹤
@@ -544,20 +510,40 @@ void loop() {
     jetsonComms.update();
 
     // 輪詢各 PIO UART RX，接收 Slave 回傳的 COBS 遙測幀
-    processPioRx(moveUart,    moveRxBuf,    "Move",
-                 latestMoveTm,    lastMoveTmUs);
-    processPioRx(shootUart,   shootRxBuf,   "Shoot",
-                 latestShootTm,   lastShootTmUs);
-    processPioRx(storageUart, storageRxBuf, "Storage",
-                 latestStorageTm, lastStorageTmUs);
+    processPioRx(moveUart, moveRxBuf, "Move", latestMoveTm, lastMoveTmUs);
+    processPioRx(shootUart, shootRxBuf, "Shoot", latestShootTm, lastShootTmUs);
+    processPioRx(storageUart, storageRxBuf, "Storage", latestStorageTm,
+                 lastStorageTmUs);
 
     // Slave 當機偵測：逾時500ms 無遙測 → 發送 REBOOT
     checkSlaveTimeouts();
 
     uint64_t now = time_us_64();
-    if (now - lastJetsonFrameUs > RobotConfig::HEARTBEAT_TIMEOUT_US) {
+    if(now - lastJetsonFrameUs > RobotConfig::HEARTBEAT_TIMEOUT_US) {
         // Jetson 斷線 → 啟用遙控備援
         tryRcFallback();
+    }
+
+    // ---- 除錯：每 500ms 印 RC 狀態與送了什麼到 Move ----
+    static uint64_t lastDbgUs = 0;
+    if(now - lastDbgUs > 500000ULL) {
+        lastDbgUs = now;
+        if(rc_failsafe) {
+            Serial.println("[HUB] RC FAILSAFE → 送 E-STOP 到 Move");
+        } else {
+            int16_t ch[10];
+            // 讀取 Core 1 的 RC 資料
+            for(int i = 0; i < 10; i++)
+                ch[i] = rc_channels[i];
+            Serial.printf(
+                "[HUB] ch0=%d ch1=%d ch2=%d ch3=%d ch4=%d ch5=%d ch6=%d "
+                "ch7=%d ch8=%d ch9=%d\n",
+                ch[0], ch[1], ch[2], ch[3], ch[4],
+                ch[5], ch[6], ch[7], ch[8], ch[9]);
+            Serial.printf(
+                "[HUB] → vx=%d vy=%d omega=%d\n",
+                rcToInt8(ch[1]), rcToInt8(ch[0]), rcToInt8(ch[7]));
+        }
     }
 
     delayMicroseconds(20);
@@ -570,9 +556,7 @@ void loop() {
 // 因 Jetson 改用 USB CDC，UART0 已空出給 CRSF 使用。
 // ELRS 接收機需設為非反向輸出 (serial_inverted = off)。
 // ============================================================================
-void setup1() {
-    crsf.begin(0, 1, 420000);
-}
+void setup1() { crsf.begin(0, 1, 420000); }
 
 // ============================================================================
 // Core 1: loop1() — 安全守門員與手動介入
@@ -581,14 +565,14 @@ void setup1() {
 // 解完後寫入全域 rc_channels / rc_failsafe，供 Core 0 低代價讀取。
 // ============================================================================
 void loop1() {
-    while (true) {
+    while(true) {
         crsf.update();
 
         // 逐元素寫入全域變數 (避免 volatile pointer 傳入 memcpy 的編譯錯誤)
         // RP2350 SCU 保證 cache coherency，Core 0 讀取時可見最新值
         int16_t ch[10];
         crsf.getChannels(ch);
-        for (int i = 0; i < 10; i++) {
+        for(int i = 0; i < 10; i++) {
             rc_channels[i] = ch[i];
         }
         rc_failsafe = crsf.isFailsafe();

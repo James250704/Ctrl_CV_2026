@@ -150,18 +150,24 @@ bool CrsfReceiver::feedByte(uint8_t byte) {
 
 void CrsfReceiver::decodeRcChannels(const uint8_t* payload,
                                     uint16_t* channels) {
-    channels[0] = (payload[0] << 3) | (payload[1] >> 5);
-    channels[1] = ((payload[1] & 0x1F) << 6) | (payload[2] >> 2);
-    channels[2] =
-        ((payload[2] & 0x03) << 9) | (payload[3] << 1) | (payload[4] >> 7);
-    channels[3] = ((payload[4] & 0x7F) << 4) | (payload[5] >> 4);
-    channels[4] = ((payload[5] & 0x0F) << 7) | (payload[6] >> 1);
-    channels[5] =
-        ((payload[6] & 0x01) << 10) | (payload[7] << 2) | (payload[8] >> 6);
-    channels[6] = ((payload[8] & 0x3F) << 5) | (payload[9] >> 3);
-    channels[7] = ((payload[9] & 0x07) << 8) | payload[10];
-    channels[8] = (payload[11] << 3) | (payload[12] >> 5);
-    channels[9] = ((payload[12] & 0x1F) << 6) | (payload[13] >> 2);
+    // CRSF RC 封包：16 通道以 11-bit 連續位元流排列（LSB-first，無間隙）。
+    // 逐一取 bit 是最穩健且經實測驗證的寫法（等同 user 端 unpack11）：
+    //   每通道累積 11 bits，bitpos/bytepos 持續遞增，永不回退。
+    // CRSF payload 共 22 bytes = 176 bits = 16 通道 × 11，剛好不越界。
+    uint8_t bytepos = 0, bitpos = 0;
+    for(uint8_t i = 0; i < 16; i++) {
+        uint16_t v = 0;
+        for(uint8_t b = 0; b < 11; b++) {
+            uint8_t bit = static_cast<uint8_t>((payload[bytepos] >> bitpos) & 1U);
+            v |= static_cast<uint16_t>(bit) << b;
+            bitpos++;
+            if(bitpos >= 8) {
+                bitpos = 0;
+                bytepos++;
+            }
+        }
+        channels[i] = v;
+    }
 }
 
 int16_t CrsfReceiver::normalizeChannel(uint16_t raw_val, uint8_t ch_idx) {
@@ -171,15 +177,14 @@ int16_t CrsfReceiver::normalizeChannel(uint16_t raw_val, uint8_t ch_idx) {
     if(val > (RC_CENTER + RC_RANGE))
         val = RC_CENTER + RC_RANGE;
 
-    if(ch_idx == 2) {
-        int32_t min_raw = RC_CENTER - RC_RANGE;
-        return static_cast<int16_t>((val - min_raw) * 100 / (RC_RANGE * 2));
-    } else {
-        int16_t out = static_cast<int16_t>((val - RC_CENTER) * 100 / RC_RANGE);
-        if(ch_idx == 6)
-            out = -out;
-        return out;
-    }
+    // 統一雙極映射：中間點 (RC_CENTER=992) → 0，全範圍 (992±820) → -100~+100
+    // 適用所有通道（含 Throttle），讓每個遙桿在中立點都回傳 0。
+    int16_t out = static_cast<int16_t>((val - RC_CENTER) * 100 / RC_RANGE);
+
+    // CH6 通道方向校正（遙控器特定設置，不影響中立點）
+    if(ch_idx == 6)
+        out = -out;
+    return out;
 }
 
 void CrsfReceiver::update() {
