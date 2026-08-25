@@ -72,9 +72,31 @@ constexpr uint16_t ENC_COUNTS_PER_REV = ENC_LINE_PPR * 4; // 4X → 1772
 // 閉迴路 PID 出力上限（duty%）。
 //   採保守 30%（與早期調参/歷史一致）：「命令+ → 馬達最多 30%」。
 //   安全煞車，避免 PID 發散時全出力衝撞。若確認穩定後要更大出力再放寬。
-constexpr float PID_MAX_DUTY = 30.0f;
+constexpr float PID_MAX_DUTY = 100.0f;
+// 積分放寬「風扇」餘裕（duty%）：積分上下限 = |ff*target| + 此值。
+//   讓積分只補足命令前饋以下的小誤差，避免低速時積分風扇到 ±100
+//   造成爆衝、也避免歸零時一次性大幅跳變。若慢速摩擦力需更多出力再加大。
+constexpr float WINDUP_MARGIN_DUTY = 6.0f;
 // 速度量測一階低通時間常數 (s)
 constexpr float VEL_LPF_TAU = 0.010f;
+
+// 停車指令判定閾值 (RPS)：目標輪轉速低於此值視為「停」，
+//   強制清空 PID 積分，避免殘留積分造成零指令下馬達緩慢蠕動。
+constexpr float StopCmdEpsRps = 0.005f;
+
+// ---- 車身 S 曲線速度剖面（SCurveRamp）參數 ----
+//   單位：車身速度為 RPS，加速度 RPS/s，Jerk RPS/s²。
+//   目標行為：
+//     起步（從 0）→ 慢段小坡克服靜摩擦 → 中段加速 → 平滑到位
+//     減速（往 0）→ 快速但 Jerk 限幅、不瞬停
+//   這些值需在實測車上調（依車重/摩擦/PID）；以下為初始合理值。
+constexpr float SCURVE_ACCEL = 4.0f;  // 加速上限 (RPS/s) — 平緩加速
+constexpr float SCURVE_DECEL = 12.0f; // 減速上限 (RPS/s) — 快速減速(3×加速)
+constexpr float SCURVE_JERK = 60.0f;  // Jerk 上限 (RPS/s²) — S 形圓角
+constexpr float SCURVE_START_SLOW_VEL = 0.20f; // 起步慢段速度窗 (RPS)
+constexpr float SCURVE_START_ACCEL =
+    1.5f; // 起步加速上限 (RPS/s) — 慢提克服靜摩擦
+constexpr float SCURVE_SETTLE_TOL = 0.010f; // 到位判定 (RPS)
 } // namespace MoveCfg
 
 // ============================================================================
@@ -100,6 +122,68 @@ static const int8_t kWheelPolarity[4] = {1, -1, 1, -1};
 // 編碼器讀取極性：FR/BR 因鏡像安裝在讀取端反轉 → 「馬達往前」四顆同號。
 //   與 kWheelPolarity 相同，形成自洽閉環（命令 + → 馬達往前 → 回授 +）。
 static const int8_t kEncReadPolarity[4] = {1, -1, 1, -1};
+
+// 車身兩條平移軸（vx = 左右 strafe、vy = 前後 forward）各自獨立方向開關。
+//   依實測車身方向微調，每條軸獨立 +1/-1，互不干擾 ω（旋轉）。
+//   ⚠ 四輪閉迴路為逐輪自洽伺服，且方向與 ω 皆經由同一組輪速組合產生，
+//     因此只能「一次翻一條軸」在車上實測確認，勿兩條同時猜。
+static const int8_t kAxisStrafePolarity = 1;
+static const int8_t kAxisForwardPolarity = -1;
+
+// ============================================================================
+// 車身 S 曲線速度剖面（jerk-limited，非對稱加/減速）
+//   每車身軸（vx / vy / omega）一套，單位皆 RPS（加速度 RPS/s）。
+//   作用於原始指令 → 平滑後指令，再餵給運動學/PID。
+//   目標：
+//     起步（從 0）→ 慢段小坡克服靜摩擦 → 中段加速 → 平滑到位
+//     減速（往 0）→ 快速但 Jerk 限幅、不瞬停
+//   穩態追蹤時 y==target（無誤差、無積分風扇）；僅在目標改變時作用。
+// ============================================================================
+struct SCurveRamp {
+    float y = 0.f;     // 平滑後指令輸出（此軸）
+    float accel = 0.f; // 目前加速度（RPS/s）
+
+    // 更新並回傳平滑後輸出（一行呼叫）
+    float updatePw(float target, float dt) {
+        update(target, dt);
+        return y;
+    }
+
+    // 每控制週期呼叫，把 y 往 target 平滑推進
+    void update(float target, float dt) {
+        float err = target - y;
+        if(fabsf(err) < MoveCfg::SCURVE_SETTLE_TOL) {
+            y = target;
+            accel = 0.f;
+            return;
+        }
+        // 判斷加/減速：目標比目前更靠近 0 → 減速（快速，且維持方向）
+        const bool decel = (y != 0.f) && ((err > 0.f) != (y > 0.f));
+        float cap = decel ? MoveCfg::SCURVE_DECEL : MoveCfg::SCURVE_ACCEL;
+        // 起步慢段：從 0 出發且速度尚小 → 限加速度以小斜率起步克服靜摩擦
+        if(!decel && fabsf(y) < MoveCfg::SCURVE_START_SLOW_VEL)
+            cap = (cap < MoveCfg::SCURVE_START_ACCEL)
+                      ? cap
+                      : MoveCfg::SCURVE_START_ACCEL;
+
+        // Jerk 限幅：加速度以 kJerk 斜率往目標 cap 逼近 → S 形圓角
+        const float aim = (err > 0.f) ? cap : -cap;
+        const float maxDa = MoveCfg::SCURVE_JERK * dt;
+        float da = aim - accel;
+        if(da > maxDa)
+            da = maxDa;
+        if(da < -maxDa)
+            da = -maxDa;
+        accel += da;
+
+        y += accel * dt;
+
+        // 防止越過目標（overshoot）：越過即鎖定在 target
+        if((y - target) * err < 0.f)
+            y = target;
+    }
+};
+static SCurveRamp rampVx, rampVy, rampOmega; // 車身三軸各一套
 
 // ============================================================================
 // 四輪狀態
@@ -270,16 +354,23 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
         dt = 0.05f;
     lastTickUs = nowUs;
 
+    // ---- 車身 S 曲線速度剖面 ----
+    //   平滑原始指令 → 平滑後指令，再餵給運動學/PID。
+    //   起步（從 0）慢提速克服靜摩擦、減速快速但不瞬停。
+    const float rVx = rampVx.updatePw(cmd.vx, dt);
+    const float rVy = rampVy.updatePw(cmd.vy, dt);
+    const float rOmega = rampOmega.updatePw(cmd.omega, dt);
+
     // 車身速度 (RPS) → 各輪目標線速度 (m/s)
-    //   cmd.vx>0（往前）→ lin[0..3] 全正；FR/BR 再由輸出極性反相（鏡像）。
-    float wx = cmd.vx * TWO_PI; // rad/s
-    float wy = cmd.vy * TWO_PI; // rad/s
+    //   rVx>0（往前）→ lin[0..3] 全正；FR/BR 再由輸出極性反相（鏡像）。
+    float wx = kAxisStrafePolarity * rVx * TWO_PI;  // rad/s（左右軸方向開關）
+    float wy = kAxisForwardPolarity * rVy * TWO_PI; // rad/s（前後軸方向開關）
     float K = MoveCfg::HALF_LENGTH + MoveCfg::HALF_WIDTH;
     float lin[4];
-    lin[0] = (wx - wy - K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // FL
-    lin[1] = (wx + wy + K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // FR
-    lin[2] = (wx + wy - K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // BL
-    lin[3] = (wx - wy + K * cmd.omega) * MoveCfg::WHEEL_RADIUS; // BR
+    lin[0] = (wx - wy - K * rOmega) * MoveCfg::WHEEL_RADIUS; // FL
+    lin[1] = (wx + wy + K * rOmega) * MoveCfg::WHEEL_RADIUS; // FR
+    lin[2] = (wx + wy - K * rOmega) * MoveCfg::WHEEL_RADIUS; // BL
+    lin[3] = (wx - wy + K * rOmega) * MoveCfg::WHEEL_RADIUS; // BR
 
     // 目標輪轉速 targetRps[i] = lin / (2π*r)，單位 rev/s (RPS)
     float targetRps[4];
@@ -301,14 +392,34 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
 
         const float err = targetRps[i] - w.measRps;
 
-        // FF 前饋 + PI + 抗飽和
+        // 「停車指令」：目標轉速≈0 時強制清空積分。
+        //   先前移動時積分會蓄積穩態偏置（蓄積越大維持速度的 bias），
+        //   若不清空，煞車後輸出 ≈ 殘留積分 → 馬達在零指令下仍緩慢蠕動。
+        //   清空後於減速過程僅剩 P 項（-kP*meas）主動煞至 0 再穩住。
+        if(fabsf(targetRps[i]) < MoveCfg::StopCmdEpsRps)
+            w.integral = 0.0f;
+
+        // ---- PI 控制器（含抗風扇 + 低速精細化）----
         const WheelPidCfg& pid = kPidCfg[i];
-        float p = pid.kP * err;
-        w.integral += pid.kI * err * dt;
-        if(w.integral > MoveCfg::PID_MAX_DUTY)
-            w.integral = MoveCfg::PID_MAX_DUTY;
-        if(w.integral < -MoveCfg::PID_MAX_DUTY)
-            w.integral = -MoveCfg::PID_MAX_DUTY;
+        const float ff = pid.ff * targetRps[i]; // 前饋出力 (duty%)
+        const float p = pid.kP * err;
+
+        // 積分上下限隨指令縮放：只讓積分補足「命令前饋出力以下」的誤差。
+        //   低速指令 → 積分維持很小 → 能精細控制、且歸零時不會 80→0 大跳變。
+        //   （+WINDUP_MARGIN_DUTY 為摩擦/動態餘裕）
+        float iLimit = fabsf(ff) + MoveCfg::WINDUP_MARGIN_DUTY;
+        if(iLimit > MoveCfg::PID_MAX_DUTY)
+            iLimit = MoveCfg::PID_MAX_DUTY;
+
+        // 抗風扇：積分已達縮放上限且誤差同向（繼續累積只會加劇飽和）→ 暫停
+        const bool windup = (w.integral >= iLimit && err > 0.f) ||
+                            (w.integral <= -iLimit && err < 0.f);
+        if(!windup)
+            w.integral += pid.kI * err * dt;
+        if(w.integral > iLimit)
+            w.integral = iLimit;
+        if(w.integral < -iLimit)
+            w.integral = -iLimit;
 
         float dterm = 0.0f;
         if(w.hasPrev) {
@@ -317,7 +428,7 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
         w.prevMeas = w.measRps;
         w.hasPrev = true;
 
-        float out = p + w.integral + dterm + pid.ff * targetRps[i];
+        float out = p + w.integral + dterm + ff;
         if(out > MoveCfg::PID_MAX_DUTY)
             out = MoveCfg::PID_MAX_DUTY;
         if(out < -MoveCfg::PID_MAX_DUTY)
@@ -336,9 +447,9 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
         tm.targetRps[i] = targetRps[i];
         tm.pwmOutput[i] = wheels[i].outDuty;
     }
-    tm.cmdVx = cmd.vx;
-    tm.cmdVy = cmd.vy;
-    tm.cmdOmega = cmd.omega;
+    tm.cmdVx = rVx;
+    tm.cmdVy = rVy;
+    tm.cmdOmega = rOmega;
     tm.mode = (uint8_t)RobotMode::AUTO;
     tm.estopFlag = 0;
     tm.timestamp = (uint32_t)(nowUs & 0xFFFFFFFFULL);
