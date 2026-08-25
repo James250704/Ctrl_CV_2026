@@ -1,0 +1,39 @@
+;
+; quad_phase.pio
+;
+; Per-wheel quadrature phase sampler (one SM per wheel, PIO0).
+;
+; Reads one encoder's A/B channels; on EVERY channel transition, pushes the
+; current 2-bit phase (bit0 = first sampled pin) to the RX FIFO.
+;
+; Host drains the FIFO and accumulates a signed count via the Gray-code
+; transition table — RP2040 PIO has no ADD instruction (X only decrements via
+; `jmp x--`), so a single-SM signed accumulator is not possible; the tiny
+; host-side phase transition is free of interrupts.
+;
+; Key properties:
+;   - No GPIO interrupts: the PIO does all pin edge detection (hardware).
+;   - One SM per encoder -> 4 SMs on PIO0, per CLAUDE.md ("PIO0 all 4 SM encoder").
+;   - Minimal PIO: loop reads pins, skips if unchanged, pushes phase otherwise.
+;
+; Wireup:
+;   sm_config_set_in_pins(base = encoder A pin)  => bit0 = A, bit1 = B
+;
+; 7 instructions.
+;
+
+.program quad_phase
+
+; OSR = previous phase (persist). X = prev, copied at loop top.
+.wrap_target
+top:
+    mov x, osr          ; 0.  x = prev phase
+    in pins, 2          ; 1.  isr = cur phase (bit0=A, bit1=B)
+    mov y, isr          ; 2.  y = cur
+    jmp x != y, do_push ; 3.  changed -> push
+    jmp top             ; 4.  no change -> loop
+do_push:
+    mov osr, y          ; 5.  prev = cur (for next)
+    mov isr, y          ; 6.  isr = cur (value to push)
+    push                ; 7.  push phase to RX FIFO, wrap to top
+.wrap
