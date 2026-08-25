@@ -42,16 +42,25 @@ static constexpr uint32_t ECHO_TIMEOUT_US = 30000U; // 30 ms ~ 最大距離約 5
 static constexpr uint32_t ECHO_MIN_WAIT_US = 400U;  // 感測器需約 300 us 啟動
 
 // ============================================================================
+// 距離校準偏移
+// 實測診斷：這顆 US-100 是 active-LOW 觸發，且距離有固定 +~35mm 偏移
+//   （量內部換能器膜片，非外殼前沿）。單顆測試用 45mm（使用者自訂）。
+//   正式版先沿用單顆測試校正值；若裝上車體後對位誤差明顯，再實測重新校正。
+// ============================================================================
+static constexpr int32_t DIST_OFFSET_MM =
+    45; // 感測器距離 - 實際距離 的固定偏移
+
+// ============================================================================
 // GPIO 腳位定義 — 6 顆 US-100 以 GPIO Trigger/Echo 模式運作
 //
 // 腳位編號：GPxx = Pico 板上的實體腳位
 // ============================================================================
 
 // --- 前方感測器（面向前方）---
-static constexpr uint8_t PIN_TRIG_FRONT_LEFT = 6;  // GP6  = Pin 12  | Trigger
-static constexpr uint8_t PIN_ECHO_FRONT_LEFT = 7;  // GP7  = Pin 13  | Echo
-static constexpr uint8_t PIN_TRIG_FRONT_RIGHT = 8; // GP8  = Pin 14  | Trigger
-static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 9; // GP9  = Pin 15  | Echo
+static constexpr uint8_t PIN_TRIG_FRONT_LEFT = 2;  // GP6  = Pin 12  | Trigger
+static constexpr uint8_t PIN_ECHO_FRONT_LEFT = 3;  // GP7  = Pin 13  | Echo
+static constexpr uint8_t PIN_TRIG_FRONT_RIGHT = 4; // GP8  = Pin 14  | Trigger
+static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 5; // GP9  = Pin 15  | Echo
 
 // --- 左側感測器（面向左方）---
 static constexpr uint8_t PIN_TRIG_LEFT_1 =
@@ -175,9 +184,11 @@ static uint g_pio1Offset = 0;
 // 30 ms 回音的最大計數：約 1,875,000 < 2^31，uint32 安全。
 // ============================================================================
 static uint32_t rawCountToMm(uint32_t count) {
-    // d_mm = count * 343 / 125000
-    return static_cast<uint32_t>((static_cast<uint64_t>(count) * 343ULL) /
-                                 125000ULL);
+    // d_mm = count * 343 / 125000（先算原始距離 mm，再扣校準偏移）
+    const int32_t mm = static_cast<int32_t>(
+        (static_cast<uint64_t>(count) * 343ULL) / 125000ULL);
+    const int32_t corrected = mm - DIST_OFFSET_MM;
+    return (corrected > 0) ? static_cast<uint32_t>(corrected) : 0;
 }
 
 // ============================================================================
@@ -188,19 +199,22 @@ static uint32_t g_distanceMm[SENSOR_COUNT];
 static bool g_valid[SENSOR_COUNT];
 
 // ============================================================================
-// 分組觸發 — 將 TRIG 腳設為 HIGH，等待 12 us，再設為 LOW
+// 分組觸發 — active-LOW 觸發。
+// 已診斷確認：這顆 US-100 的 Trigger 是「閒置 HIGH、拉 LOW」觸發
+//   （電表量 Trigger pad 斷開時閒置 3.3V；手動拉 LOW 才回 Echo）。
+// 故此處：將 TRIG 腳拉到 LOW，等 12us，再回 HIGH。
 // ============================================================================
 static void fireGroupTrigger(SensorGroup group) {
     for(int i = 0; i < SENSOR_COUNT; i++) {
         if(sensorConfigs[i].group == group)
-            digitalWrite(sensorConfigs[i].trigPin, HIGH);
+            digitalWrite(sensorConfigs[i].trigPin, LOW); // 拉 LOW 觸發
     }
 
     delayMicroseconds(TRIGGER_PULSE_US);
 
     for(int i = 0; i < SENSOR_COUNT; i++) {
         if(sensorConfigs[i].group == group)
-            digitalWrite(sensorConfigs[i].trigPin, LOW);
+            digitalWrite(sensorConfigs[i].trigPin, HIGH); // 回閒置 HIGH
     }
 }
 
@@ -410,11 +424,13 @@ void setup() {
     }
 
     // 2. 初始化 trigger/echo GPIO
-    //    HC-SR04 的 Echo 是推挽輸出，下拉電阻不會干擾；
-    //    未接的 Echo 腳設為 INPUT_PULLDOWN 防止浮接被相鄰 Trigger 耦合觸發。
+    //    這顆 US-100 是 active-LOW 觸發 → Trigger 閒置 HIGH、觸發時拉 LOW。
+    //    Echo 的輸出閒置 LOW，INPUT_PULLDOWN 不會干擾；
+    //    未接的 Echo 腳設為 INPUT_PULLDOWN 防浮接被相鄰 Trigger 耦合觸發。
     for(int i = 0; i < SENSOR_COUNT; i++) {
         pinMode(sensorConfigs[i].trigPin, OUTPUT);
-        digitalWrite(sensorConfigs[i].trigPin, LOW);
+        digitalWrite(sensorConfigs[i].trigPin,
+                     HIGH); // 閒置 HIGH（active-low 觸發）
         pinMode(sensorConfigs[i].echoPin, INPUT_PULLDOWN);
     }
 
@@ -434,10 +450,10 @@ void setup() {
     // 4. 使用正確的 echo 腳位初始化每個 SM
     for(int i = 0; i < SENSOR_COUNT; i++) {
         const SensorConfig& cfg = sensorConfigs[i];
-        // 使用 pio_add_program() 回傳的實際偏移量（非 cfg.pioOffset，因 const 陣列恆為 0）
+        // 使用 pio_add_program() 回傳的實際偏移量（非 cfg.pioOffset，因 const
+        // 陣列恆為 0）
         uint offset = (cfg.pio == pio0) ? g_pio0Offset : g_pio1Offset;
-        ultrasonic_echo_program_init(cfg.pio, cfg.sm, offset,
-                                     cfg.echoPin);
+        ultrasonic_echo_program_init(cfg.pio, cfg.sm, offset, cfg.echoPin);
     }
 
     // 5. 以初始量測值填充中位數緩衝區
