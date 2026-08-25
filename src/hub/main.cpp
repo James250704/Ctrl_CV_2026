@@ -249,7 +249,8 @@ static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
 // hbIntervalUs=0 停用心跳 — 因為 Hub→Slaves 方向為主機發送控制幀，
 // 不需要定期心跳（Slave 端已有指令逾時 100ms E-Stop 保護）。
 // ============================================================================
-static ChassisComms jetsonComms(&Serial, TargetID::HUB, 0); // 無心跳（測試未接 Jetson）
+static ChassisComms jetsonComms(&Serial, TargetID::HUB,
+                                0); // 無心跳（測試未接 Jetson）
 static ChassisComms moveComms(&moveUart, TargetID::MOVE, 0);
 static ChassisComms shootComms(&shootUart, TargetID::SHOOT, 0);
 static ChassisComms storageComms(&storageUart, TargetID::STORAGE, 0);
@@ -371,12 +372,13 @@ static ControlPacket rcToMovePacket() {
     pkt.targetID = TargetID::MOVE;
     pkt.payloadLen = sizeof(ControlPacket) - 6 - 2;
 
-    pkt.move.vx = rcToInt8(rc_channels[1]); // CH1 → vx
-    pkt.move.vy = rcToInt8(rc_channels[0]); // CH0 → vy
+    pkt.move.vx = rcToInt8(rc_channels[1]);    // CH1 → vx
+    pkt.move.vy = rcToInt8(rc_channels[0]);    // CH0 → vy
     pkt.move.omega = rcToInt8(rc_channels[7]); // CH7 → omega
 
     // (CH6 安全開關歸零暫移除 — 測試期間先讓命令直通 Move)
-    // if(rc_channels[5] < 0) { pkt.move.vx = pkt.move.vy = pkt.move.omega = 0; }
+    // if(rc_channels[5] < 0) { pkt.move.vx = pkt.move.vy = pkt.move.omega = 0;
+    // }
 
     pkt.crc16 = 0;
     pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t*>(&pkt),
@@ -445,7 +447,10 @@ static void tryRcFallback() {
     ControlPacket mv = rcToMovePacket();
     bool sent = moveComms.sendPacket(mv);
     static uint32_t sendOk = 0, sendFail = 0;
-    if(sent) sendOk++; else sendFail++;
+    if(sent)
+        sendOk++;
+    else
+        sendFail++;
 
     // 除錯：直接對照「讀到的 rc_channels」與「送出的 mv.move.vx」
     // 確認 rcToMovePacket 是否真的把 rc_channels[1] 塞進 vx
@@ -457,8 +462,8 @@ static void tryRcFallback() {
         Serial.printf("[HUB] chan1=%d chan0=%d chan7=%d | mv.vx=%d mv.vy=%d "
                       "mv.omega=%d | byte6,7,8=%02X %02X %02X\n",
                       rc_channels[1], rc_channels[0], rc_channels[7],
-                      mv.move.vx, mv.move.vy, mv.move.omega,
-                      pr[6], pr[7], pr[8]);
+                      mv.move.vx, mv.move.vy, mv.move.omega, pr[6], pr[7],
+                      pr[8]);
     }
 
     // 每 1 秒印一次 send 統計 + PIO 狀態（判斷是否真的寫入 GP2）
@@ -466,8 +471,8 @@ static void tryRcFallback() {
     uint64_t nowDbg = time_us_64();
     if(nowDbg - lastSendDbgUs > 1000000ULL) {
         lastSendDbgUs = nowDbg;
-        Serial.printf("[HUB] PIO send ok=%u fail=%u rxAvail=%d\n",
-                      sendOk, sendFail, moveUart.available());
+        Serial.printf("[HUB] PIO send ok=%u fail=%u rxAvail=%d\n", sendOk,
+                      sendFail, moveUart.available());
     }
 }
 
@@ -538,11 +543,10 @@ void loop() {
             Serial.printf(
                 "[HUB] ch0=%d ch1=%d ch2=%d ch3=%d ch4=%d ch5=%d ch6=%d "
                 "ch7=%d ch8=%d ch9=%d\n",
-                ch[0], ch[1], ch[2], ch[3], ch[4],
-                ch[5], ch[6], ch[7], ch[8], ch[9]);
-            Serial.printf(
-                "[HUB] → vx=%d vy=%d omega=%d\n",
-                rcToInt8(ch[1]), rcToInt8(ch[0]), rcToInt8(ch[7]));
+                ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], ch[6], ch[7], ch[8],
+                ch[9]);
+            Serial.printf("[HUB] → vx=%d vy=%d omega=%d\n", rcToInt8(ch[1]),
+                          rcToInt8(ch[0]), rcToInt8(ch[7]));
         }
     }
 
