@@ -90,13 +90,12 @@ constexpr float StopCmdEpsRps = 0.005f;
 //     起步（從 0）→ 慢段小坡克服靜摩擦 → 中段加速 → 平滑到位
 //     減速（往 0）→ 快速但 Jerk 限幅、不瞬停
 //   這些值需在實測車上調（依車重/摩擦/PID）；以下為初始合理值。
-constexpr float SCURVE_ACCEL = 4.0f;  // 加速上限 (RPS/s) — 平緩加速
-constexpr float SCURVE_DECEL = 12.0f; // 減速上限 (RPS/s) — 快速減速(3×加速)
-constexpr float SCURVE_JERK = 60.0f;  // Jerk 上限 (RPS/s²) — S 形圓角
+constexpr float SCURVE_ACCEL = 4.0f;           // 加速上限 (RPS/s) — 平緩加速
+constexpr float SCURVE_DECEL = 12.0f;          // 減速上限 (RPS/s) — 快速減速(3×加速)
+constexpr float SCURVE_JERK = 60.0f;           // Jerk 上限 (RPS/s²) — S 形圓角
 constexpr float SCURVE_START_SLOW_VEL = 0.20f; // 起步慢段速度窗 (RPS)
-constexpr float SCURVE_START_ACCEL =
-    1.5f; // 起步加速上限 (RPS/s) — 慢提克服靜摩擦
-constexpr float SCURVE_SETTLE_TOL = 0.010f; // 到位判定 (RPS)
+constexpr float SCURVE_START_ACCEL = 1.5f;     // 起步加速上限 (RPS/s) — 慢提克服靜摩擦
+constexpr float SCURVE_SETTLE_TOL = 0.010f;    // 到位判定 (RPS)
 } // namespace MoveCfg
 
 // ============================================================================
@@ -279,7 +278,7 @@ static void encoderInit() {
 // ============================================================================
 // 前向宣告
 // ============================================================================
-static void onMoveCommand(const ChassisSnapshot& cmd);
+static void onMoveCommand(const ChassisSnapshot &cmd);
 static void onMoveEstop();
 
 // ============================================================================
@@ -335,7 +334,7 @@ static void initWheelPwm(uint gpio) {
 // onMoveCommand — Core 1 收到命令時執行一次控制週期
 //   四輪皆速度閉迴路 PID：編碼器 RPS 回授 → ff + PI（抗飽和）→ duty%
 // ============================================================================
-static void onMoveCommand(const ChassisSnapshot& cmd) {
+static void onMoveCommand(const ChassisSnapshot &cmd) {
     dbg_cmdCount++;
     dbg_vx = cmd.vx;
     dbg_vy = cmd.vy;
@@ -381,7 +380,7 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
     // ---- 四輪閉迴路 PID ----
     const float alpha = dt / (MoveCfg::VEL_LPF_TAU + dt);
     for(int i = 0; i < 4; i++) {
-        WheelState& w = wheels[i];
+        WheelState &w = wheels[i];
         const int32_t c = enc[i]; // 已套 kEncReadPolarity（統一方向）
         const int32_t d = c - w.encCount;
         w.encCount = c;
@@ -400,7 +399,7 @@ static void onMoveCommand(const ChassisSnapshot& cmd) {
             w.integral = 0.0f;
 
         // ---- PI 控制器（含抗風扇 + 低速精細化）----
-        const WheelPidCfg& pid = kPidCfg[i];
+        const WheelPidCfg &pid = kPidCfg[i];
         const float ff = pid.ff * targetRps[i]; // 前饋出力 (duty%)
         const float p = pid.kP * err;
 

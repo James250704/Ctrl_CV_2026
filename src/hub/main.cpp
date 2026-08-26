@@ -116,7 +116,7 @@ static constexpr uint64_t SLAVE_TELEMETRY_TIMEOUT_US = 500000ULL; // 500ms
 // 輔助函式：COBS 解碼（inline，從原始 COBS 位元組流解碼）
 // 回傳解碼後的位元組數，失敗回傳 0。
 // ============================================================================
-static size_t cobsDecodeInline(const uint8_t* src, size_t len, uint8_t* dst,
+static size_t cobsDecodeInline(const uint8_t *src, size_t len, uint8_t *dst,
                                size_t dstSize) {
     size_t readIdx = 0;
     size_t writeIdx = 0;
@@ -155,8 +155,8 @@ static size_t cobsDecodeInline(const uint8_t* src, size_t len, uint8_t* dst,
 //   - 72 bytes + TELEMETRY → 存入 telemetryOut，更新 lastTmUs
 //   - 20 bytes + CONTROL/ESTOP/HEARTBEAT → Serial.printf log（保留除錯用）
 // ============================================================================
-static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
-                         MoveTelemetry& telemetryOut, uint64_t& lastTmUs) {
+static void processPioRx(SerialPIO &uart, PioRxBuffer &rxBuf, const char *name,
+                         MoveTelemetry &telemetryOut, uint64_t &lastTmUs) {
     while(uart.available() > 0) {
         uint8_t byte = static_cast<uint8_t>(uart.read());
 
@@ -181,7 +181,7 @@ static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
             // CRC 驗證
             if(decodedLen <
                8) { // 最小:
-                    // sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
+                // sync(1)+msgType(1)+frameSeq(1)+targetID(1)+payloadLen(2)+crc16(2)
                 Serial.printf("[PIO RX][%s] too short: %zu bytes\n", name,
                               decodedLen);
                 rxBuf.len = 0;
@@ -213,8 +213,8 @@ static void processPioRx(SerialPIO& uart, PioRxBuffer& rxBuf, const char* name,
                     static_cast<unsigned long>(telemetryOut.timestamp));
             } else if(decodedLen >= sizeof(ControlPacket)) {
                 // 控制/心跳/E-Stop 封包 (20 bytes)
-                const ControlPacket& pkt =
-                    *reinterpret_cast<const ControlPacket*>(decoded);
+                const ControlPacket &pkt =
+                    *reinterpret_cast<const ControlPacket *>(decoded);
                 Serial.printf(
                     "[PIO RX][%s] pkt: msgType=%d, frameSeq=%d, targetID=%d\n",
                     name, pkt.msgType, pkt.frameSeq, pkt.targetID);
@@ -261,7 +261,7 @@ static ChassisComms storageComms(&storageUart, TargetID::STORAGE, 0);
 // 則透過對應的 ChassisComms 發送 REBOOT 訊息觸發 slave 重開機。
 // 發送後將 lastTmUs 歸零，避免重複 reboot。
 // ============================================================================
-static void sendReboot(ChassisComms& comms, uint8_t targetID) {
+static void sendReboot(ChassisComms &comms, uint8_t targetID) {
     ControlPacket reboot = {};
     reboot.sync = 0xA5;
     reboot.msgType = MsgType::REBOOT;
@@ -270,7 +270,7 @@ static void sendReboot(ChassisComms& comms, uint8_t targetID) {
     reboot.payloadLen = sizeof(ControlPacket) - 6 - 2;
     reboot.crc16 = 0;
     reboot.crc16 = SignalUtils::calculateCrc(
-        reinterpret_cast<const uint8_t*>(&reboot), sizeof(ControlPacket) - 2);
+        reinterpret_cast<const uint8_t *>(&reboot), sizeof(ControlPacket) - 2);
     comms.sendPacket(reboot);
     Serial.printf("[HUB] Sent REBOOT to targetID=%d\n", targetID);
 }
@@ -320,7 +320,7 @@ static uint64_t lastRcForwardUs = 0;   // RC 備援最後轉發時間
 // 主要用於 E-Stop 廣播（targetID=BROADCAST + msgType=ESTOP）
 // 一般控制不使用此函式（各 Slave 有各自的 targetID 和 payload）
 // ============================================================================
-static void forwardAllSlaves(const ControlPacket& pkt) {
+static void forwardAllSlaves(const ControlPacket &pkt) {
     moveComms.sendPacket(pkt);
     shootComms.sendPacket(pkt);
     storageComms.sendPacket(pkt);
@@ -375,7 +375,7 @@ static ControlPacket rcToMovePacket() {
     pkt.move.omega = rcToInt8(rc_channels[7]); // CH7 → omega
 
     pkt.crc16 = 0;
-    pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t*>(&pkt),
+    pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t *>(&pkt),
                                           sizeof(ControlPacket) - 2);
     return pkt;
 }
@@ -387,7 +387,7 @@ static ControlPacket rcToMovePacket() {
 // Core 0 當場根據 targetID 呼叫對應 slave 的 ChassisComms.sendPacket()，
 // 一條龍處理，完全不需跨核心傳遞。
 // ============================================================================
-static void onJetsonFrame(const ControlPacket& pkt) {
+static void onJetsonFrame(const ControlPacket &pkt) {
     lastJetsonFrameUs = time_us_64();
 
     switch(pkt.targetID) {
@@ -431,7 +431,7 @@ static void tryRcFallback() {
         estop.payloadLen = sizeof(ControlPacket) - 6 - 2;
         estop.crc16 = 0;
         estop.crc16 = SignalUtils::calculateCrc(
-            reinterpret_cast<uint8_t*>(&estop), sizeof(ControlPacket) - 2);
+            reinterpret_cast<uint8_t *>(&estop), sizeof(ControlPacket) - 2);
         forwardAllSlaves(estop);
         return;
     }
@@ -452,7 +452,7 @@ static void tryRcFallback() {
     uint64_t nowPkt = time_us_64();
     if(nowPkt - lastPktDbgUs > 1000000ULL) {
         lastPktDbgUs = nowPkt;
-        const uint8_t* pr = reinterpret_cast<const uint8_t*>(&mv);
+        const uint8_t *pr = reinterpret_cast<const uint8_t *>(&mv);
         Serial.printf("[HUB] chan1=%d chan0=%d chan7=%d | mv.vx=%d mv.vy=%d "
                       "mv.omega=%d | byte6,7,8=%02X %02X %02X\n",
                       rc_channels[1], rc_channels[0], rc_channels[7],
