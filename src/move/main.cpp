@@ -471,12 +471,53 @@ static void onMoveEstop() {
 }
 
 // ============================================================================
+// 狀態 LED（板載 LED，例如 Waveshare RP2350 Plus 板上 LED）
+//   常亮  = E-Stop 生效
+//   閃爍  = 已連線（近期收到 Hub 有效命令）
+//   熄滅  = 未連線且非 E-Stop（<100ms 無有效命令）
+// ============================================================================
+namespace LedCfg {
+// 連線判定：最後有效命令距今超過此毫秒 → 視為斷線
+constexpr uint32_t CONNECTED_TIMEOUT_MS = 100;
+constexpr uint16_t BLINK_PERIOD_MS = 500; // 閃爍半週期（亮/滅各 250ms）
+} // namespace LedCfg
+
+static void updateStatusLed() {
+    static uint32_t lastToggle = 0;
+    static bool ledOn = false;
+
+    const bool estop = slave.isEstopActive();
+    const bool connected =
+        slave.msSinceLastValidCmd() < LedCfg::CONNECTED_TIMEOUT_MS;
+
+    if(estop) {
+        digitalWrite(LED_BUILTIN, HIGH); // E-Stop → 常亮
+        return;
+    }
+    if(!connected) {
+        digitalWrite(LED_BUILTIN, LOW); // 斷線且非 E-Stop → 熄滅
+        return;
+    }
+
+    // 已連線 → 閃爍
+    const uint32_t now = millis();
+    if(now - lastToggle >= LedCfg::BLINK_PERIOD_MS) {
+        lastToggle = now;
+        ledOn = !ledOn;
+        digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
+    }
+}
+
+// ============================================================================
 // Core 0
 // ============================================================================
 void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println("[MOVE] FL 閉迴路 PID + 其他開迴路（等待 Hub 命令）");
+
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
 
     slave.begin();
 
@@ -503,6 +544,7 @@ void setup() {
 
 void loop() {
     slave.update();
+    updateStatusLed();
 
     static uint32_t lastPrint = 0;
     uint32_t nowCfg = millis();

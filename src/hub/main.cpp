@@ -26,7 +26,6 @@
 //    - Jetson 正常發送 → Core 0 直接轉發至 slaves (自動模式)
 //    - Jetson 逾時 (>500ms) → Core 0 改用 Core 1 的遙控數據 (備援)
 //    - 遙控也斷線 (Failsafe) → 發送 E-Stop 廣播至所有 slaves
-//    - RC CH6 = -100 → 強制 E-Stop (安全開關)
 //
 // 腳位分配：
 //   USB    ←→ Jetson (CDC Serial)       — ChassisComms 綁定 &Serial
@@ -345,7 +344,6 @@ static void forwardAllSlaves(const ControlPacket& pkt) {
 //
 //   Storage:
 //     CH9            → rc_channels[8]  → motorChannel  PCA9685 通道 0~15
-//     CH6 (AUX2)     → rc_channels[5]  → sw + E-Stop   0/1，-100 時所有歸零
 //     CH10           → rc_channels[9]  → trigger       0/1（> 50 視為 1）
 // ============================================================================
 
@@ -375,10 +373,6 @@ static ControlPacket rcToMovePacket() {
     pkt.move.vx = rcToInt8(rc_channels[1]);    // CH1 → vx
     pkt.move.vy = rcToInt8(rc_channels[0]);    // CH0 → vy
     pkt.move.omega = rcToInt8(rc_channels[7]); // CH7 → omega
-
-    // (CH6 安全開關歸零暫移除 — 測試期間先讓命令直通 Move)
-    // if(rc_channels[5] < 0) { pkt.move.vx = pkt.move.vy = pkt.move.omega = 0;
-    // }
 
     pkt.crc16 = 0;
     pkt.crc16 = SignalUtils::calculateCrc(reinterpret_cast<uint8_t*>(&pkt),

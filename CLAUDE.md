@@ -129,7 +129,6 @@ Core 0 形成獨立閉環系統，避免跨核心傳遞開銷：
 1. `jetsonComms.update()` — USB CDC 讀取 + COBS 解包 → 當場依 targetID 呼叫對應 `moveComms.sendPacket()` / `shootComms.sendPacket()` / `storageComms.sendPacket()`
 2. Jetson 逾時（>500ms）→ `tryRcFallback()` → 讀取 Core 1 的 RC 數據 → 轉發至所有 Slaves
 3. RC 斷線（Failsafe）→ 發送 E-Stop 廣播至所有 Slaves
-4. RC CH5 = -100 → 強制 E-Stop（安全開關）
 
 ### Slaves (Move / Shoot / Storage)
 
@@ -344,7 +343,6 @@ Storage： Hub SM2 TX(GP6) → Storage RX(GP1), Storage TX(GP0) → Hub SM2 RX(G
 - Slave Core 0 收到 E-Stop → atomic<bool> `estopActive_` store release → Core 1 歸零 PWM
 - Core 1 繼續 spinloop 等待，不 reboot
 - E-Stop 解除後收到有效控制幀自動恢復
-- Hub 端 RC CH5 = -100 → 強制歸零所有輸出（包括 Move/Shoot/Storage）
 
 ### Slave 當機重開機 (REBOOT)
 
@@ -377,7 +375,6 @@ UART0 @ 420000 baud
 | CH3 (Throttle) | rc_channels[2] | upSpeed（上射速度） | Shoot |
 | CH4 (Yaw) | rc_channels[3] | omega（旋轉） | Move |
 | CH5 | rc_channels[4] | downSpeed（下射速度） | Shoot |
-| CH6 (AUX2) | rc_channels[5] | sw + E-Stop（-100 時所有歸零） | Storage + 全局 |
 | CH7 | rc_channels[6] | pitch（俯仰） | Shoot |
 | CH8 | rc_channels[7] | row（旋轉） | Shoot |
 | CH9 | rc_channels[8] | motorChannel（PCA9685 通道 0~15） | Storage |
@@ -388,8 +385,7 @@ UART0 @ 420000 baud
 1. Jetson 正常發送 → Core 0 直接轉發至 Slaves（自動模式）
 2. Jetson 逾時（>500ms）→ Core 0 改用 Core 1 的 RC 數據（備援）
 3. RC 也斷線（Failsafe）→ 發送 E-Stop 廣播至所有 Slaves
-4. CH6 安全開關 = -100 → 強制 E-Stop
-5. 死區濾波：-10~10 → 0，避免微小抖動
+4. 死區濾波：-10~10 → 0，避免微小抖動
 
 ---
 
@@ -400,18 +396,22 @@ UART0 @ 420000 baud
 - Shoot Slave 通訊: PIO0 SM1 -> TX: GP4, RX: GP5
 - Storage Slave 通訊: PIO0 SM2 -> TX: GP6, RX: GP7
 - CRSF 接收機: UART0 -> RX: GP1 (420000 baud)
-- 🚫 GP4/GP5 同時用於 PIO SM1 (Shoot) 與 UART1 除錯 — 不應同時啟用，PIO SM1 優先
 
 ### 2. Move Slave 節點腳位與參數
 - UART0 映射: TX: GP0, RX: GP1 (與 Hub 通訊)
 - 馬達驅動型式: 硬體 PWM + DIR (非 PIO PWM)
-- 四輪腳位: FL(PWM:GP6, DIR:GP7), FR(PWM:GP8, DIR:GP9), BL(PWM:GP10, DIR:GP11), BR(PWM:GP12, DIR:GP13)
-- 四輪編碼器 PIO 腳位: FL(A:GP14, B:GP15), FR(A:GP16, B:GP17), BL(A:GP18, B:GP19), BR(A:GP20, B:GP21)
-- BMI270 IMU I2C: SCL:GP5, SDA:GP4 (i2c0 @ 400kHz)
+- 四輪腳位（依 `src/move/main.cpp` `Pin` namespace 實測驗證結果）:
+  **FR(PWM:GP6, DIR:GP7), FL(PWM:GP9, DIR:GP8), BR(PWM:GP10, DIR:GP11), BL(PWM:GP12, DIR:GP13)**
+- 四輪編碼器 PIO 腳位（依實際實測驗證）:
+  FR(A:GP14, B:GP15), FL(A:GP16, B:GP17), BR(A:GP20, B:GP21), BL(A:GP18, B:GP19)
 - PIO 資源: PIO0 全部 4 SM 做 Encoder，PIO1 未使用
-- 馬達參數: 1:27 減速比, 432 PPR (軟體常數 `ENC_COUNTS_PER_REV = 4 * 1200`)
+- 馬達參數: 1:27 減速比, 實測線數 `ENC_LINE_PPR = 443` (軟體常數 `ENC_COUNTS_PER_REV = 443 * 4 = 1772`)
 - 車身參數: HALF_LENGTH=0.25m, HALF_WIDTH=0.25m, WHEEL_RADIUS=0.05m
-- 期望控制週期: 100Hz (10ms)，由 Jetson/Hub 控制幀頻率決定
+- 馬達極性/編碼器方向: `kWheelPolarity[]` = `{1,-1,1,-1}`（FR/BR 反相）; `kEncReadPolarity[]` = `{1,-1,1,-1}`（FR/BR 鏡像）; 車身軸方向開關 `kAxisStrafePolarity=+1`, `kAxisForwardPolarity=-1`
+- 車身三軸 S 曲線速度剖面（jerk-limited 非對稱加/減速）: 加速 4.0, 減速 12.0, Jerk 60.0 RPS/s²
+- 閉迴路 PID 上限: `PID_MAX_DUTY=100%`，積分風扇餘裕 `WINDUP_MARGIN_DUTY=6%`
+- 期望控制週期: 由 Jetson/Hub 控制幀頻率決定（典型 10–20ms）
+- **狀態 LED（板載 `LED_BUILTIN`）**: E-Stop→常亮, 已連線(<100ms 有效命令)→閃爍, 斷線→熄滅（`updateStatusLed()` 於 Core 0 loop() 呼叫）
 
 ### 3. Shoot Slave 節點腳位與參數
 - UART0: TX: GP0, RX: GP1 (與 Hub 通訊)
