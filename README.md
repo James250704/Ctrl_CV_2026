@@ -125,7 +125,7 @@ Hub Core 1 以 420000 baud 接收遙控訊號，Jetson 斷線（>500ms）時作�
 | CH3 (Throttle) | `[2]` | `upSpeed` | 上射速度 | Shoot |
 | CH4 (Yaw) | `[3]` | `omega` | 旋轉 | Move |
 | CH5 | `[4]` | `downSpeed` | 下射速度 | Shoot |
-| CH6 | `[5]` | — | 未使用 | — |
+| CH6 | `[5]` | — | - | — |
 | CH7 | `[6]` | `pitch` | 俯仰（±100 → ±90°） | Shoot |
 | CH8 | `[7]` | `row` | 橫向旋轉（±100 → ±90°） | Shoot |
 | CH9 | `[8]` | `motorChannel` | PCA9685 通道 0~15 | Storage |
