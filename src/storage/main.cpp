@@ -104,7 +104,7 @@ constexpr ServoConfig SERVO_PRESETS[SERVO_CHANNEL_COUNT] = {
 // PCA9685 驅動 (純 I2C, 無外部依賴)
 // ============================================================================
 namespace Pca9685Driver {
-static i2c_inst_t* i2c = i2c1;
+static i2c_inst_t *i2c = i2c1;
 
 bool init() {
     // 初始化 I2C1
@@ -218,7 +218,7 @@ static bool channelState[Pca9685::SERVO_CHANNEL_COUNT] = {false};
 void init() {
     // 初始化所有伺服為關閉位置
     for(uint8_t ch = 0; ch < Pca9685::SERVO_CHANNEL_COUNT; ch++) {
-        const auto& preset = Pca9685::SERVO_PRESETS[ch];
+        const auto &preset = Pca9685::SERVO_PRESETS[ch];
         Pca9685Driver::setChannelPulseUs(ch, preset.offPulseUs);
         channelState[ch] = false;
     }
@@ -235,7 +235,7 @@ void setChannel(uint8_t channel, bool sw) {
     if(channelState[channel] == sw)
         return;
 
-    const auto& preset = Pca9685::SERVO_PRESETS[channel];
+    const auto &preset = Pca9685::SERVO_PRESETS[channel];
     uint16_t pulseUs = sw ? preset.onPulseUs : preset.offPulseUs;
     Pca9685Driver::setChannelPulseUs(channel, pulseUs);
     channelState[channel] = sw;
@@ -245,7 +245,7 @@ void estop() {
     // E-Stop: 所有伺服回到關閉位置
     for(uint8_t ch = 0; ch < Pca9685::SERVO_CHANNEL_COUNT; ch++) {
         if(channelState[ch]) {
-            const auto& preset = Pca9685::SERVO_PRESETS[ch];
+            const auto &preset = Pca9685::SERVO_PRESETS[ch];
             Pca9685Driver::setChannelPulseUs(ch, preset.offPulseUs);
             channelState[ch] = false;
         }
@@ -336,7 +336,7 @@ static void init() {
     (void)pcaOk;
 }
 
-static void executeMotion(const ChassisSnapshot& cmd) {
+static void executeMotion(const ChassisSnapshot &cmd) {
     // 1. motorChannel + sw: 控制 PCA9685 指定通道的伺服位置
     //    命令框架每次都會傳入完整的命令資料，
     //    motorChannel 為目標通道號 (0~15)
@@ -365,7 +365,7 @@ static MoveTelemetry pendingTm = {}; // Core 1 寫入 → Core 0 發送
 
 static void onStorageEstop() { MotorControl::estop(); }
 
-static void onStorageCommand(const ChassisSnapshot& cmd) {
+static void onStorageCommand(const ChassisSnapshot &cmd) {
     MotorControl::executeMotion(cmd);
 
     // 構建遙測封包到暫存區，由 storage wrapper 在 Core 1 中交給 SlaveComms
@@ -384,12 +384,12 @@ static void onStorageCommand(const ChassisSnapshot& cmd) {
     pendingTm.timestamp = time_us_64();
     pendingTm.crc16 = 0;
     pendingTm.crc16 =
-        SignalUtils::calculateCrc(reinterpret_cast<const uint8_t*>(&pendingTm),
+        SignalUtils::calculateCrc(reinterpret_cast<const uint8_t *>(&pendingTm),
                                   sizeof(MoveTelemetry) - 2);
 }
 
 // 前向宣告：storageCommandWrapper 定義在 slave 之後
-static void storageCommandWrapper(const ChassisSnapshot& cmd);
+static void storageCommandWrapper(const ChassisSnapshot &cmd);
 
 static SlaveApp storageApp = {
     .targetID = TargetID::STORAGE,
@@ -400,7 +400,7 @@ static SlaveApp storageApp = {
 static SlaveComms slave(&storageApp);
 
 // Wrapper：先執行 onStorageCommand，再將遙測交給 SlaveComms
-static void storageCommandWrapper(const ChassisSnapshot& cmd) {
+static void storageCommandWrapper(const ChassisSnapshot &cmd) {
     onStorageCommand(cmd);
     slave.prepareTelemetry(pendingTm);
 }

@@ -34,12 +34,12 @@
 //   hubComms.update();
 // ============================================================================
 class ChassisComms {
-public:
+  public:
     /// @param stream      綁定的 Stream（Serial / SerialPIO / HardwareSerial）
     /// @param hbTarget    心跳的 targetID（預設 TargetID::HUB）
     /// @param hbIntervalUs 心跳間隔微秒（預設 30000us = 30ms，設 0 停用心跳）
-    ChassisComms(Stream* stream,
-                 uint8_t hbTarget    = TargetID::HUB,
+    ChassisComms(Stream *stream,
+                 uint8_t hbTarget = TargetID::HUB,
                  uint64_t hbIntervalUs = RobotConfig::HEARTBEAT_INTERVAL_US);
 
     /// 開始運作（重設內部 COBS 掃描狀態、幀序號、心跳計時器）
@@ -53,43 +53,43 @@ public:
     void update();
 
     /// 收到有效解碼遙測幀時觸發的回呼
-    using TelemetryCallback = void (*)(const MoveTelemetry& telemetry);
+    using TelemetryCallback = void (*)(const MoveTelemetry &telemetry);
     void setTelemetryCallback(TelemetryCallback cb) { telemetryCb = cb; }
 
     /// 發送 MoveTelemetry 遙測封包（COBS 編碼 + 寫入 Stream）
     /// 由 Slave 端在 Core 1 中呼叫，將遙測資料回傳給 Hub
-    bool sendTelemetry(const MoveTelemetry& telemetry);
+    bool sendTelemetry(const MoveTelemetry &telemetry);
 
     /// 收到有效解碼幀時觸發的回呼
-    using FrameCallback = void (*)(const ControlPacket& pkt);
+    using FrameCallback = void (*)(const ControlPacket &pkt);
     void setFrameCallback(FrameCallback cb) { frameCb = cb; }
 
     /// 發送 ControlPacket（COBS 編碼 + CRC 戳記 + 寫入 Stream）
     /// 非阻塞：若 Stream 有剩餘 TX 空間則寫入，否則靜默丟棄
     /// @return true = 已寫入, false = 已丟棄
-    bool sendPacket(const ControlPacket& pkt);
+    bool sendPacket(const ControlPacket &pkt);
 
-private:
-    ChassisComms(const ChassisComms&) = delete;
-    ChassisComms& operator=(const ChassisComms&) = delete;
+  private:
+    ChassisComms(const ChassisComms &) = delete;
+    ChassisComms &operator=(const ChassisComms &) = delete;
 
-    void processFrame(const uint8_t* data, size_t len);
+    void processFrame(const uint8_t *data, size_t len);
 
-    Stream*  stream;
-    uint8_t  hbTargetID;
+    Stream *stream;
+    uint8_t hbTargetID;
     uint64_t hbIntervalUs;
 
     // COBS 掃描狀態
     uint8_t parseWorkBuf[512];
-    size_t  workBufIdx = 0;
+    size_t workBufIdx = 0;
 
     // 幀追蹤
-    FrameCallback      frameCb      = nullptr;
-    TelemetryCallback  telemetryCb  = nullptr;
-    uint8_t            lastFrameSeq = 0;
-    bool               firstFrame   = true;
+    FrameCallback frameCb = nullptr;
+    TelemetryCallback telemetryCb = nullptr;
+    uint8_t lastFrameSeq = 0;
+    bool firstFrame = true;
 
     // 心跳
     uint64_t lastHeartbeatTime = 0;
-    uint8_t  txFrameSeq        = 0;
+    uint8_t txFrameSeq = 0;
 };

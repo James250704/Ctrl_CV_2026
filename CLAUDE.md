@@ -446,4 +446,3 @@ UART0 @ 420000 baud
 
 - 禁止 C-style cast，強制 `static_cast` / `reinterpret_cast`
 - 變數 camelCase，類別 PascalCase，巨集/腳位 UPPER_SNAKE_CASE
-- 所有 GPIO 標註實體 pin 編號（`GP6 = Pin 12`）

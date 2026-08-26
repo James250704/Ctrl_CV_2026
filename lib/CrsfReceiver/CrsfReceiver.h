@@ -28,7 +28,7 @@ class CrsfReceiver {
   private:
     // 內部 CRSF 核心解析函式
     bool feedByte(uint8_t byte);
-    void decodeRcChannels(const uint8_t* payload, uint16_t* channels);
+    void decodeRcChannels(const uint8_t *payload, uint16_t *channels);
     int16_t normalizeChannel(uint16_t raw_val, uint8_t ch_idx);
 
     // 靜態中斷服務程式 (ISR)
@@ -48,7 +48,10 @@ class CrsfReceiver {
     uint8_t _frameBuf[64];
     size_t _frameLen;
     size_t _frameNeed;
-    enum { SYNC, LEN, TYPE_PAYLOAD, CRC } _state;
+    enum { SYNC,
+           LEN,
+           TYPE_PAYLOAD,
+           CRC } _state;
 };
 
 #endif // CRSF_RECEIVER_H

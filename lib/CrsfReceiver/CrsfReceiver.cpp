@@ -83,7 +83,7 @@ CrsfReceiver::CrsfReceiver()
 
 void CrsfReceiver::begin(uint8_t uart_id, uint8_t rx_pin, uint32_t baudrate) {
     _uart_id = uart_id;
-    uart_inst_t* uart = (_uart_id == 0) ? uart0 : uart1;
+    uart_inst_t *uart = (_uart_id == 0) ? uart0 : uart1;
     uint irq_num = (_uart_id == 0) ? UART0_IRQ : UART1_IRQ;
 
     uart_init(uart, baudrate);
@@ -148,8 +148,8 @@ bool CrsfReceiver::feedByte(uint8_t byte) {
     return false;
 }
 
-void CrsfReceiver::decodeRcChannels(const uint8_t* payload,
-                                    uint16_t* channels) {
+void CrsfReceiver::decodeRcChannels(const uint8_t *payload,
+                                    uint16_t *channels) {
     // CRSF RC 封包：16 通道以 11-bit 連續位元流排列（LSB-first，無間隙）。
     // 逐一取 bit 是最穩健且經實測驗證的寫法（等同 user 端 unpack11）：
     //   每通道累積 11 bits，bitpos/bytepos 持續遞增，永不回退。

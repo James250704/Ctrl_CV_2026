@@ -17,7 +17,7 @@
 #define quad_phase_pio_version 0
 
 static const uint16_t quad_phase_program_instructions[] = {
-            //     .wrap_target
+    //     .wrap_target
     0xa027, //  0: mov    x, osr
     0x4002, //  1: in     pins, 2
     0xa046, //  2: mov    y, isr
@@ -46,4 +46,3 @@ static inline pio_sm_config quad_phase_program_get_default_config(uint offset) {
     return c;
 }
 #endif
-

@@ -17,7 +17,7 @@
 #define ultrasonic_echo_pio_version 0
 
 static const uint16_t ultrasonic_echo_program_instructions[] = {
-            //     .wrap_target
+    //     .wrap_target
     0x80a0, //  0: pull   block
     0xa02b, //  1: mov    x, ~null
     0x20a0, //  2: wait   1 pin, 0
@@ -94,9 +94,9 @@ static inline void ultrasonic_echo_trigger(PIO pio, uint sm) {
  * Returns true if data available.
  * ------------------------------------------------------------------- */
 static inline bool ultrasonic_echo_read(PIO pio, uint sm,
-                                        uint32_t* count,
-                                        bool* timedOut) {
-    if (pio_sm_is_rx_fifo_empty(pio, sm))
+                                        uint32_t *count,
+                                        bool *timedOut) {
+    if(pio_sm_is_rx_fifo_empty(pio, sm))
         return false;
     *count = pio_sm_get(pio, sm);
     *timedOut = (*count == 0);
@@ -114,4 +114,3 @@ static inline void ultrasonic_echo_reset(PIO pio, uint sm, uint offset) {
 }
 
 #endif
-

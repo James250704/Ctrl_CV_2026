@@ -1,0 +1,10 @@
+CompileFlags:
+  Add:
+    - "-D_STDATOMIC_H"
+    - "-Ilib/ChassisComms"
+    - "-Ilib/SlaveComms"
+    - "-Iinclude"
+    - "-Isrc"
+    - "-std=gnu++17"
+    - "-ferror-limit=0"
+    - "-Wno-everything"

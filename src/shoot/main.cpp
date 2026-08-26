@@ -200,7 +200,7 @@ void setRowTarget(float input) { rowTarget = inputToSteps(input); }
 void setPitchTarget(float input) { pitchTarget = inputToSteps(input); }
 
 /// 單軸增量移動，每次呼叫最多 maxSteps 步
-static bool moveOneAxis(int32_t& pos, int32_t target, uint stepPin, uint dirPin,
+static bool moveOneAxis(int32_t &pos, int32_t target, uint stepPin, uint dirPin,
                         int maxSteps) {
     int32_t diff = target - pos;
     if(diff == 0)
@@ -245,7 +245,7 @@ void estop() {
 static uint8_t tmFrameSeq = 0;       // 遙測幀序號
 static MoveTelemetry pendingTm = {}; // Core 1 寫入 → Core 0 發送
 
-static void onShootCommand(const ChassisSnapshot& cmd) {
+static void onShootCommand(const ChassisSnapshot &cmd) {
     // 永久性速度：每次命令都儲存並套用（包括速度=0的清零指令）
     SpeedStorage::saveUpSpeed(cmd.shootUpSpeed);
     SpeedStorage::saveDownSpeed(cmd.shootDownSpeed);
@@ -273,7 +273,7 @@ static void onShootCommand(const ChassisSnapshot& cmd) {
     pendingTm.timestamp = time_us_64();
     pendingTm.crc16 = 0;
     pendingTm.crc16 =
-        SignalUtils::calculateCrc(reinterpret_cast<const uint8_t*>(&pendingTm),
+        SignalUtils::calculateCrc(reinterpret_cast<const uint8_t *>(&pendingTm),
                                   sizeof(MoveTelemetry) - 2);
 }
 
@@ -283,7 +283,7 @@ static void onShootEstop() {
 }
 
 // 前向宣告：shootCommandWrapper 定義在 slave 之後
-static void shootCommandWrapper(const ChassisSnapshot& cmd);
+static void shootCommandWrapper(const ChassisSnapshot &cmd);
 
 static SlaveApp shootApp = {
     .targetID = TargetID::SHOOT,
@@ -294,7 +294,7 @@ static SlaveApp shootApp = {
 // Wrapper：先執行 onShootCommand，再將遙測交給 SlaveComms
 static SlaveComms slave(&shootApp);
 
-static void shootCommandWrapper(const ChassisSnapshot& cmd) {
+static void shootCommandWrapper(const ChassisSnapshot &cmd) {
     onShootCommand(cmd);
     slave.prepareTelemetry(pendingTm);
 }

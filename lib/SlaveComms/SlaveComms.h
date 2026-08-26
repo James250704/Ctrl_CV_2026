@@ -64,7 +64,7 @@ struct SlaveApp {
 
     /// 收到有效控制幀時呼叫（Core 1 context，不可阻塞）
     /// @param cmd  解碼後的命令（vx/vy/omega 已轉為 float，單位 RPS）
-    void (*onCommand)(const ChassisSnapshot& cmd);
+    void (*onCommand)(const ChassisSnapshot &cmd);
 
     /// E-Stop 觸發時呼叫（Core 0 或 Core 1 context）
     /// 應立即歸零所有 PWM / 馬達輸出
@@ -75,9 +75,9 @@ struct SlaveApp {
 // SlaveComms — 核心類別
 // ============================================================================
 class SlaveComms {
-public:
+  public:
     /// @param app  應用層回呼介面（必須存活超過 SlaveComms 生命期）
-    explicit SlaveComms(SlaveApp* app)
+    explicit SlaveComms(SlaveApp *app)
         : app_(app),
           hubComms_(&Serial1, TargetID::HUB, RobotConfig::HEARTBEAT_INTERVAL_US) {}
 
@@ -106,15 +106,15 @@ public:
     /// 4. 發送遙測（每50ms 一次）
     void update() {
         // Reboot 優先：收到 Hub 的 REBOOT 訊息後立即重開機
-        if (rebootRequested_) {
-            watchdog_reboot(0, 0, 0);  // RP2350 watchdog 立即標準重開機
+        if(rebootRequested_) {
+            watchdog_reboot(0, 0, 0); // RP2350 watchdog 立即標準重開機
         }
 
         hubComms_.update();
 
         uint64_t now = time_us_64();
-        if (!estopActive_.load(std::memory_order_acquire) &&
-            (now - lastValidCmdTime_ > RobotConfig::COMMAND_TIMEOUT_US)) {
+        if(!estopActive_.load(std::memory_order_acquire) &&
+           (now - lastValidCmdTime_ > RobotConfig::COMMAND_TIMEOUT_US)) {
             triggerEstop();
         }
 
@@ -142,37 +142,37 @@ public:
     ///
     /// 不回傳，永遠執行直到系統重啟。
     void runCore1() {
-        while (true) {
+        while(true) {
             // E-Stop 優先檢查
-            if (estopActive_.load(std::memory_order_acquire)) {
-                if (app_->onEstop != nullptr)
+            if(estopActive_.load(std::memory_order_acquire)) {
+                if(app_->onEstop != nullptr)
                     app_->onEstop();
                 continue;
             }
 
             // 讀取命令
-            if (cmdValid_.load(std::memory_order_acquire)) {
+            if(cmdValid_.load(std::memory_order_acquire)) {
                 ChassisSnapshot localCmd;
                 memcpy(&localCmd, &sharedCmd_, sizeof(ChassisSnapshot));
                 cmdValid_.store(false, std::memory_order_release);
 
-                if (app_->onCommand != nullptr)
+                if(app_->onCommand != nullptr)
                     app_->onCommand(localCmd);
-                continue;  // 執行完命令後直接下一輪，不經 idleHook
+                continue; // 執行完命令後直接下一輪，不經 idleHook
             }
 
             // 空閒回呼（如步進馬達增量移動）
-            if (idleHook_ != nullptr)
+            if(idleHook_ != nullptr)
                 idleHook_();
         }
     }
 
     /// 手動觸發 E-Stop（可在外部呼叫）
     void triggerEstop() {
-        if (estopActive_.load(std::memory_order_acquire))
+        if(estopActive_.load(std::memory_order_acquire))
             return;
         estopActive_.store(true, std::memory_order_release);
-        if (app_->onEstop != nullptr)
+        if(app_->onEstop != nullptr)
             app_->onEstop();
     }
 
@@ -196,38 +196,38 @@ public:
     uint32_t validCmdCount() const { return validCmdCount_; }
 
     /// 取得 ChassisComms 參考（用於自訂收發）
-    ChassisComms& comms() { return hubComms_; }
+    ChassisComms &comms() { return hubComms_; }
 
     /// Core 1 呼叫：準備遙測資料，由 Core 0 在下次 update() 中發送。
     /// 在 onCommand() callback 中構建 MoveTelemetry 後呼叫此方法。
     /// 使用 memcpy + atomic flag 進行跨核心傳遞。
-    void prepareTelemetry(const MoveTelemetry& tm) {
+    void prepareTelemetry(const MoveTelemetry &tm) {
         memcpy(&pendingTelemetry_, &tm, sizeof(MoveTelemetry));
         telemetryReady_.store(true, std::memory_order_release);
     }
 
-private:
-    SlaveComms(const SlaveComms&) = delete;
-    SlaveComms& operator=(const SlaveComms&) = delete;
+  private:
+    SlaveComms(const SlaveComms &) = delete;
+    SlaveComms &operator=(const SlaveComms &) = delete;
 
     // ========================================================================
     // ChassisComms 幀回呼（static thunk → 成員函式）
     // ========================================================================
-    static void onFrameThunk(const ControlPacket& pkt) {
-        if (instance_ != nullptr)
+    static void onFrameThunk(const ControlPacket &pkt) {
+        if(instance_ != nullptr)
             instance_->onFrame(pkt);
     }
 
-    void onFrame(const ControlPacket& pkt) {
+    void onFrame(const ControlPacket &pkt) {
         // E-Stop 廣播 — 優先處理（CLAUDE.md §E-Stop 安全機制）
-        if (pkt.msgType == MsgType::ESTOP) {
+        if(pkt.msgType == MsgType::ESTOP) {
             triggerEstop();
             return;
         }
 
         // Reboot 指令 — Hub 偵測到本 Slave 遙測逾時時發送
-        if (pkt.msgType == MsgType::REBOOT) {
-            if (instance_ != nullptr)
+        if(pkt.msgType == MsgType::REBOOT) {
+            if(instance_ != nullptr)
                 instance_->rebootRequested_ = true;
             return;
         }
@@ -236,11 +236,11 @@ private:
         // 一般 CONTROL 廣播（如 RC 備援）只送 MOVE 的 targetID
 
         // 只處理控制幀
-        if (pkt.msgType != MsgType::CONTROL)
+        if(pkt.msgType != MsgType::CONTROL)
             return;
 
         // 過濾非自己的幀
-        if (pkt.targetID != app_->targetID && pkt.targetID != TargetID::BROADCAST)
+        if(pkt.targetID != app_->targetID && pkt.targetID != TargetID::BROADCAST)
             return;
 
         // 更新最後有效幀時間（逾時保護用）+ 計數
@@ -251,19 +251,19 @@ private:
         constexpr float SCALE = RobotConfig::MAX_RPS / 127.0f;
         ChassisSnapshot snap = {};
 
-        if (pkt.targetID == TargetID::MOVE) {
-            snap.vx    = static_cast<float>(pkt.move.vx) * SCALE;
-            snap.vy    = static_cast<float>(pkt.move.vy) * SCALE;
+        if(pkt.targetID == TargetID::MOVE) {
+            snap.vx = static_cast<float>(pkt.move.vx) * SCALE;
+            snap.vy = static_cast<float>(pkt.move.vy) * SCALE;
             snap.omega = static_cast<float>(pkt.move.omega) * SCALE;
-        } else if (pkt.targetID == TargetID::SHOOT) {
-            snap.shootUpSpeed   = static_cast<float>(pkt.shoot.upSpeed);
+        } else if(pkt.targetID == TargetID::SHOOT) {
+            snap.shootUpSpeed = static_cast<float>(pkt.shoot.upSpeed);
             snap.shootDownSpeed = static_cast<float>(pkt.shoot.downSpeed);
-            snap.pitch          = static_cast<float>(pkt.shoot.pitch);
-            snap.row            = static_cast<float>(pkt.shoot.row);
-        } else if (pkt.targetID == TargetID::STORAGE) {
+            snap.pitch = static_cast<float>(pkt.shoot.pitch);
+            snap.row = static_cast<float>(pkt.shoot.row);
+        } else if(pkt.targetID == TargetID::STORAGE) {
             snap.motorChannel = pkt.storage.motorChannel;
-            snap.sw           = pkt.storage.sw;
-            snap.trigger      = pkt.storage.trigger;
+            snap.sw = pkt.storage.sw;
+            snap.trigger = pkt.storage.trigger;
         }
 
         snap.frameSeq = pkt.frameSeq;
@@ -277,7 +277,7 @@ private:
         cmdValid_.store(true, std::memory_order_release);
 
         // 如果 E-Stop 曾觸發，現在收到有效幀 → 解除
-        if (estopActive_.load(std::memory_order_acquire)) {
+        if(estopActive_.load(std::memory_order_acquire)) {
             estopActive_.store(false, std::memory_order_release);
         }
     }
@@ -285,7 +285,7 @@ private:
     // ========================================================================
     // 成員變數
     // ========================================================================
-    SlaveApp* app_;
+    SlaveApp *app_;
     ChassisComms hubComms_;
 
     // Core 0 ↔ Core 1 共享命令（單緩衝 + atomic flag）
@@ -296,7 +296,7 @@ private:
     static inline uint32_t validCmdCount_ = 0;
 
     // 遙測：Core 1 寫入 → Core 0 發送（單緩衝 + atomic flag）
-    static constexpr uint64_t TELEMETRY_INTERVAL_US = 50000ULL;  // 50ms = 20Hz
+    static constexpr uint64_t TELEMETRY_INTERVAL_US = 50000ULL; // 50ms = 20Hz
     MoveTelemetry pendingTelemetry_{};
     std::atomic<bool> telemetryReady_{false};
     uint64_t lastTelemetrySendUs_ = 0;
@@ -305,7 +305,7 @@ private:
     volatile bool rebootRequested_ = false;
 
     // static this 指標供 thunk 使用
-    static inline SlaveComms* instance_ = nullptr;
+    static inline SlaveComms *instance_ = nullptr;
 
     // Core 1 空閒回呼（不為 null 時每次 spinloop 迭代非命令/非 E-Stop 時呼叫）
     void (*idleHook_)() = nullptr;
@@ -314,11 +314,11 @@ private:
     // 遙測定時發送（Core 0 context）
     // ========================================================================
     void sendTelemetryIfReady() {
-        if (!telemetryReady_.load(std::memory_order_acquire))
+        if(!telemetryReady_.load(std::memory_order_acquire))
             return;
 
         uint64_t now = time_us_64();
-        if (now - lastTelemetrySendUs_ < TELEMETRY_INTERVAL_US)
+        if(now - lastTelemetrySendUs_ < TELEMETRY_INTERVAL_US)
             return;
 
         // 準備快照並發送

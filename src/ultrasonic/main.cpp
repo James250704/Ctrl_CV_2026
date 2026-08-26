@@ -64,18 +64,18 @@ static constexpr uint8_t PIN_ECHO_FRONT_RIGHT = 5; // GP9  = Pin 15  | Echo
 
 // --- 左側感測器（面向左方）---
 static constexpr uint8_t PIN_TRIG_LEFT_1 =
-    10; // GP10 = Pin 16  | Trigger (front)
+    10;                                        // GP10 = Pin 16  | Trigger (front)
 static constexpr uint8_t PIN_ECHO_LEFT_1 = 11; // GP11 = Pin 17  | Echo (front)
 static constexpr uint8_t PIN_TRIG_LEFT_2 =
-    12; // GP12 = Pin 18  | Trigger (rear)
+    12;                                        // GP12 = Pin 18  | Trigger (rear)
 static constexpr uint8_t PIN_ECHO_LEFT_2 = 13; // GP13 = Pin 19  | Echo (rear)
 
 // --- 右側感測器（面向右方）---
 static constexpr uint8_t PIN_TRIG_RIGHT_1 =
-    14; // GP14 = Pin 20  | Trigger (front)
+    14;                                         // GP14 = Pin 20  | Trigger (front)
 static constexpr uint8_t PIN_ECHO_RIGHT_1 = 15; // GP15 = Pin 21  | Echo (front)
 static constexpr uint8_t PIN_TRIG_RIGHT_2 =
-    16; // GP16 = Pin 22  | Trigger (rear)
+    16;                                         // GP16 = Pin 22  | Trigger (rear)
 static constexpr uint8_t PIN_ECHO_RIGHT_2 = 17; // GP17 = Pin 23  | Echo (rear)
 
 // ============================================================================
@@ -135,7 +135,7 @@ struct MedianFilter {
 static MedianFilter g_median[SENSOR_COUNT];
 
 static void medianInsert(int idx, uint32_t rawCount) {
-    MedianFilter* mf = &g_median[idx];
+    MedianFilter *mf = &g_median[idx];
     mf->buffer[mf->writeIdx] = rawCount;
     mf->writeIdx = (mf->writeIdx + 1) % MEDIAN_WINDOW;
     if(mf->count < MEDIAN_WINDOW)
@@ -143,7 +143,7 @@ static void medianInsert(int idx, uint32_t rawCount) {
 }
 
 static uint32_t medianGet(int idx) {
-    MedianFilter* mf = &g_median[idx];
+    MedianFilter *mf = &g_median[idx];
     if(mf->count == 0)
         return 0;
 
@@ -294,7 +294,7 @@ static void doMeasurementCycle() {
     // ---- Phase 1: Group A ----
     rearmGroupSMs(GROUP_A); // 1. 釋放 PIO 的 pull 阻塞，讓 PIO 開始準備監聽
     fireGroupTrigger(
-        GROUP_A); // 2. 立刻發射 Trigger 脈衝！D1 Mini 收到會秒回 Echo
+        GROUP_A);                 // 2. 立刻發射 Trigger 脈衝！D1 Mini 收到會秒回 Echo
     collectGroupResults(GROUP_A); // 3. 收集結果
 
     // ---- Phase 2: Group B ----
@@ -362,9 +362,9 @@ static void sendSerialPacket() {
 
     // 依序輸出：FL, FR, L1, L2, R1, R2
     static constexpr int sensorOrder[] = {SENSOR_FRONT_LEFT, SENSOR_FRONT_RIGHT,
-                                          SENSOR_LEFT_1,     SENSOR_LEFT_2,
-                                          SENSOR_RIGHT_1,    SENSOR_RIGHT_2};
-    static const char* sensorLabels[] = {"FL", "FR", "L1", "L2", "R1", "R2"};
+                                          SENSOR_LEFT_1, SENSOR_LEFT_2,
+                                          SENSOR_RIGHT_1, SENSOR_RIGHT_2};
+    static const char *sensorLabels[] = {"FL", "FR", "L1", "L2", "R1", "R2"};
 
     for(int i = 0; i < SENSOR_COUNT; i++) {
         int idx = sensorOrder[i];
@@ -408,7 +408,7 @@ static void sendSerialPacket() {
     buf[pos++] = '\n';
     buf[pos] = '\0';
 
-    Serial.write(reinterpret_cast<const uint8_t*>(buf),
+    Serial.write(reinterpret_cast<const uint8_t *>(buf),
                  static_cast<size_t>(pos));
     Serial.flush();
 }
@@ -449,7 +449,7 @@ void setup() {
 
     // 4. 使用正確的 echo 腳位初始化每個 SM
     for(int i = 0; i < SENSOR_COUNT; i++) {
-        const SensorConfig& cfg = sensorConfigs[i];
+        const SensorConfig &cfg = sensorConfigs[i];
         // 使用 pio_add_program() 回傳的實際偏移量（非 cfg.pioOffset，因 const
         // 陣列恆為 0）
         uint offset = (cfg.pio == pio0) ? g_pio0Offset : g_pio1Offset;
